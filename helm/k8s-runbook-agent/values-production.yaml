@@ -1,0 +1,20 @@
+# Production overrides
+agent:
+  dryRunDefault: false
+  logLevel: WARNING
+
+resources:
+  requests:
+    cpu: 250m
+    memory: 512Mi
+  limits:
+    cpu: "1"
+    memory: 1Gi
+
+escalation:
+  slaCritical: 300   # 5 min
+  slaWarning: 600    # 10 min
+  slaInfo: 1800      # 30 min
+
+secrets:
+  existingSecret: k8s-runbook-agent-external-secrets  # Use ExternalSecrets operator

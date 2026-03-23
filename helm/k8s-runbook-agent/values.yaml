@@ -1,0 +1,148 @@
+# Default values for k8s-runbook-agent
+
+replicaCount: 1
+
+image:
+  repository: k8s-runbook-agent
+  tag: ""  # Defaults to Chart.appVersion
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+
+# --- Agent Configuration ---
+agent:
+  dryRunDefault: true
+  logLevel: INFO
+  runbookPollInterval: 30
+  # Token budget per session (0 = unlimited)
+  maxTokensPerSession: 0
+
+# --- Incident Memory (pgvector RAG) ---
+incidentMemory:
+  enabled: true
+  recallLimit: 5
+  recurringThreshold: 3
+  recurringWindowDays: 7
+  voyageModel: "voyage-3"
+  voyageEmbeddingDims: 1024
+
+# --- Escalation SLAs (seconds) ---
+escalation:
+  slaCritical: 300
+  slaWarning: 900
+  slaInfo: 3600
+  group: ""  # Slack user group ID to tag
+
+# --- RBAC Authorization ---
+rbac:
+  allowedUsers: ""        # Comma-separated Slack user IDs
+  allowedGroups: ""       # Comma-separated Slack group IDs
+  seniorUsers: ""         # Users who can approve HIGH+ risk
+  minRiskForSenior: high
+
+# --- External Secrets (provide via --set or external-secrets) ---
+secrets:
+  # Required
+  anthropicApiKey: ""
+  slackBotToken: ""
+  slackSigningSecret: ""
+  grafanaWebhookSecret: ""
+  databaseUrl: ""
+  # Optional incident providers
+  pagerdutyRoutingKey: ""
+  pagerdutyApiKey: ""
+  opsgenieApiKey: ""
+  opsgenieTeam: ""
+  opsgenieRegion: us
+
+  # Use an existing Secret instead of creating one
+  existingSecret: ""
+
+# --- Slack ---
+slack:
+  channelId: ""
+
+# --- Multi-cluster ---
+clusterConfigs: ""  # JSON array
+
+# --- Pod spec ---
+podAnnotations:
+  prometheus.io/scrape: "true"
+  prometheus.io/port: "8080"
+  prometheus.io/path: "/metrics"
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  fsGroup: 1000
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi
+
+service:
+  type: ClusterIP
+  port: 80
+
+# --- Probes ---
+livenessProbe:
+  httpGet:
+    path: /health
+    port: http
+  initialDelaySeconds: 5
+  periodSeconds: 15
+
+readinessProbe:
+  httpGet:
+    path: /ready
+    port: http
+  initialDelaySeconds: 10
+  periodSeconds: 10
+
+startupProbe:
+  httpGet:
+    path: /health
+    port: http
+  initialDelaySeconds: 3
+  periodSeconds: 5
+  failureThreshold: 10
+
+# --- Autoscaling (disabled by default — single-replica agent) ---
+autoscaling:
+  enabled: false
+  minReplicas: 1
+  maxReplicas: 3
+  targetCPUUtilizationPercentage: 80
+
+# --- Network Policy ---
+networkPolicy:
+  enabled: true
+
+# --- PodDisruptionBudget ---
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 0
+
+nodeSelector: {}
+tolerations: []
+affinity: {}

@@ -1,0 +1,78 @@
+{{- if .Values.serviceAccount.create }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "k8s-runbook-agent.fullname" . }}-reader
+  labels:
+    {{- include "k8s-runbook-agent.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: [pods, pods/status, pods/log, services, endpoints, configmaps, persistentvolumeclaims, namespaces, nodes, events, secrets, serviceaccounts]
+    verbs: [get, list, watch]
+  - apiGroups: [apps]
+    resources: [deployments, deployments/status, statefulsets, statefulsets/status, daemonsets, daemonsets/status, replicasets, replicasets/status]
+    verbs: [get, list, watch]
+  - apiGroups: [autoscaling]
+    resources: [horizontalpodautoscalers, horizontalpodautoscalers/status]
+    verbs: [get, list, watch]
+  - apiGroups: [networking.k8s.io]
+    resources: [ingresses, ingresses/status, networkpolicies]
+    verbs: [get, list, watch]
+  - apiGroups: [metrics.k8s.io]
+    resources: [pods, nodes]
+    verbs: [get, list]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "k8s-runbook-agent.fullname" . }}-writer
+  labels:
+    {{- include "k8s-runbook-agent.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [apps]
+    resources: [deployments, deployments/scale, statefulsets, statefulsets/scale, daemonsets]
+    verbs: [patch, update]
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [delete]
+  - apiGroups: [""]
+    resources: [pods/eviction]
+    verbs: [create]
+  - apiGroups: [""]
+    resources: [configmaps, services]
+    verbs: [create, patch, update]
+  - apiGroups: [""]
+    resources: [secrets]
+    verbs: [create]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "k8s-runbook-agent.fullname" . }}-reader
+  labels:
+    {{- include "k8s-runbook-agent.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "k8s-runbook-agent.fullname" . }}-reader
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "k8s-runbook-agent.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "k8s-runbook-agent.fullname" . }}-writer
+  labels:
+    {{- include "k8s-runbook-agent.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "k8s-runbook-agent.fullname" . }}-writer
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "k8s-runbook-agent.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}

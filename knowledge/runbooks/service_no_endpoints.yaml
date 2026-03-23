@@ -1,0 +1,101 @@
+apiVersion: runbook/v1
+kind: DiagnosticRunbook
+
+metadata:
+  id: service-no-endpoints
+  title: "Service Has No Ready Endpoints"
+  description: "Diagnostic guide for Kubernetes Services with zero ready endpoints — covers selector mismatch, pod failures, readiness probe issues, and missing deployments."
+  severity_signals:
+    - alertname: KubeServiceWithNoEndpoints
+    - alertname: EndpointSliceNotReady
+    - alertname: ServiceEndpointsDown
+    - reason: NoEndpoints
+  tags: [service, endpoints, selector, connectivity, dns, downstream]
+
+initial_inspection:
+  - tool: get_endpoint_status
+    why: "Check how many endpoints are ready vs not-ready, and which pods back the service"
+  - tool: describe_resource
+    args:
+      kind: service
+    why: "Read the service selector, ports, and type to understand what it expects to match"
+  - tool: list_resources
+    args:
+      kind: pod
+    why: "Find pods that should match the service selector — do any exist?"
+  - tool: get_events
+    why: "Check for events related to endpoint updates or pod readiness changes"
+
+diagnosis_tree:
+  - symptom: "No pods exist matching the service selector"
+    investigation:
+      - "Compare the service's spec.selector labels with the labels on available pods"
+      - "Check if a Deployment/StatefulSet exists that should create matching pods"
+      - "Check if the deployment has 0 replicas (scaled down)"
+    root_causes:
+      - cause: "Service selector does not match any pod labels"
+        confidence_signals:
+          - "The service selector labels don't appear on any pods in the namespace"
+          - "A Deployment exists but its pod template has different labels than the service expects"
+          - "The label mismatch was introduced by a recent deployment change"
+        resolution_strategy: |
+          Compare the exact label keys and values between the Service selector and the Deployment pod template.
+          If the service selector is wrong, propose a patch to the Service.
+          If the deployment labels are wrong, propose a patch to the Deployment pod template metadata.
+          Mark as HUMAN_INPUT_REQUIRED — the agent should not guess which side is correct.
+      - cause: "Deployment scaled to 0 replicas"
+        confidence_signals:
+          - "A Deployment with matching labels exists but spec.replicas is 0"
+          - "The deployment was recently scaled down"
+        resolution_strategy: |
+          Propose scaling the deployment back up. Check the deployment's previous replica count from events.
+          If the scale-down was intentional (e.g. cost savings, maintenance), the operator should confirm.
+
+  - symptom: "Pods exist but all are NotReady (endpoints list shows not-ready addresses)"
+    investigation:
+      - "Check pod statuses — are they Running but not Ready?"
+      - "Check readiness probe configuration and recent probe failure events"
+      - "Get pod logs to see if the application reports being unhealthy"
+      - "Check if a dependency the pods need is itself down"
+    root_causes:
+      - cause: "All pods are failing their readiness probe"
+        confidence_signals:
+          - "Pods are in Running phase but 0/N containers are Ready"
+          - "Events show 'Readiness probe failed' for the pods"
+          - "Pod logs show the application started but the health endpoint returns errors"
+        resolution_strategy: |
+          Investigate why the health endpoint is failing — check pod logs for application errors.
+          Common causes: database connection failure, missing config, downstream dependency down.
+          If a downstream service is down, diagnose that service first (recursive investigation).
+          If the readiness probe config is wrong (path, port), propose a fix.
+      - cause: "Pods are stuck in Pending or ContainerCreating"
+        confidence_signals:
+          - "Pod phase is Pending, not Running"
+          - "Events show scheduling failures or image pull errors"
+        resolution_strategy: |
+          This is not a service-level issue — the pods themselves can't start.
+          Follow the pod-level diagnostic path (CrashLoopBackOff or ImagePullBackOff runbook).
+
+  - symptom: "Some endpoints are ready, some are not (partial failure)"
+    investigation:
+      - "Check which specific pods are not-ready and compare them to ready pods"
+      - "Check if not-ready pods are on the same node (node-level issue)"
+      - "Check if not-ready pods have different resource limits or configurations"
+    root_causes:
+      - cause: "Subset of pods unhealthy — possibly node-specific or version-specific"
+        confidence_signals:
+          - "Not-ready pods are concentrated on one or two nodes"
+          - "Not-ready pods have a different image version than ready pods (mid-rollout)"
+          - "The node hosting the not-ready pods has conditions like MemoryPressure"
+        resolution_strategy: |
+          If node-specific, consider cordoning the problem node and deleting the affected pods to reschedule them.
+          If rollout-related, check if the deployment rollout is stuck (see deployment-failed-rollout runbook).
+
+fallback:
+  message: "Unable to determine why the service has no ready endpoints."
+  action: "Collect service, endpoint, and pod diagnostics and escalate."
+  collect:
+    - "Full service describe output"
+    - "Endpoint status (ready and not-ready addresses)"
+    - "Pod status for all selector-matching pods"
+    - "Events in the namespace from the last 15 minutes"

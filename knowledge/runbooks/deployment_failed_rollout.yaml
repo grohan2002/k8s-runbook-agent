@@ -1,0 +1,111 @@
+apiVersion: runbook/v1
+kind: DiagnosticRunbook
+
+metadata:
+  id: deployment-failed-rollout
+  title: "Deployment Failed Rollout Diagnosis"
+  description: "Diagnostic guide for deployments stuck in rollout — covers replica mismatch, failed pods, resource quota exhaustion, and image issues."
+  severity_signals:
+    - alertname: KubeDeploymentReplicasMismatch
+    - alertname: KubeDeploymentRolloutStuck
+    - alertname: DeploymentReplicasUnavailable
+    - reason: ProgressDeadlineExceeded
+  tags: [deployment, rollout, replicas, mismatch, stuck, quota, rollback]
+
+initial_inspection:
+  - tool: describe_resource
+    args:
+      kind: deployment
+    why: "Check replica counts (desired vs ready vs updated vs available), rollout strategy, and conditions"
+  - tool: get_pod_status
+    args:
+      label_selector: "app={deployment_name}"
+    why: "Check the status of pods owned by this deployment — are new pods stuck?"
+  - tool: get_events
+    why: "Look for FailedCreate, FailedScheduling, ProgressDeadlineExceeded, or quota exceeded events"
+  - tool: get_pod_logs
+    args:
+      previous: true
+    why: "If new pods are crash-looping, get their logs for error details"
+  - tool: list_resources
+    args:
+      kind: pod
+      label_selector: "app={deployment_name}"
+    why: "See all pods (old and new ReplicaSets) to understand rollout progress"
+
+diagnosis_tree:
+  - symptom: "Updated replicas < desired replicas, new pods are in Pending state"
+    investigation:
+      - "Check events for FailedScheduling — are there insufficient resources on any node?"
+      - "Check if ResourceQuota in the namespace has been exceeded"
+      - "Check if PriorityClass or NodeAffinity rules are preventing scheduling"
+      - "Check node conditions — are all nodes Ready?"
+    root_causes:
+      - cause: "Insufficient cluster resources to schedule new pods"
+        confidence_signals:
+          - "Events show FailedScheduling with 'insufficient cpu' or 'insufficient memory'"
+          - "All nodes have resource pressure or are near capacity"
+          - "The new pods request significantly more resources than the old pods"
+        resolution_strategy: |
+          If the new pod spec increased resource requests, consider whether the increase is necessary.
+          If the cluster is genuinely full, this requires scaling the cluster (adding nodes) — escalate.
+          As a temporary measure, the operator may reduce replicas to fit within current capacity.
+          Mark as HIGH risk — the agent should not auto-scale nodes.
+      - cause: "Namespace ResourceQuota exceeded"
+        confidence_signals:
+          - "Events show 'exceeded quota' or 'forbidden: exceeded quota'"
+          - "The namespace has a ResourceQuota object and usage is at the limit"
+        resolution_strategy: |
+          Check the ResourceQuota and current usage in the namespace.
+          If the quota is artificially low, propose increasing it — but flag as HUMAN_INPUT_REQUIRED since quotas are governance controls.
+          If the quota is reasonable, the deployment needs fewer replicas or smaller resource requests.
+
+  - symptom: "New pods are running but not Ready — readiness probe failing"
+    investigation:
+      - "Check the readiness probe configuration (path, port, timeouts)"
+      - "Get logs from the new pods to see if the application started successfully"
+      - "Check if the readiness endpoint actually returns 200 (the app may have a startup bug)"
+      - "Compare the readiness probe config in the old vs new deployment spec"
+    root_causes:
+      - cause: "Application startup failure in the new version — readiness probe fails"
+        confidence_signals:
+          - "New pods are Running but 0/1 Ready"
+          - "Logs show application errors during startup or initialization"
+          - "The deployment was recently updated with a new image tag"
+        resolution_strategy: |
+          The new version has a startup issue. Propose a rollback to the previous revision.
+          Use rollback_deployment with dry_run=true first to show what will change.
+          The old revision's image tag can be identified from the ReplicaSet history.
+      - cause: "Readiness probe misconfiguration in the new spec"
+        confidence_signals:
+          - "The readiness probe path or port was changed in this deployment update"
+          - "Logs show the application started successfully but the probed endpoint doesn't exist"
+        resolution_strategy: |
+          If the probe path changed, this is likely a mistake in the deployment spec.
+          Propose a patch to fix the readiness probe configuration — but mark as HUMAN_INPUT_REQUIRED for the correct values.
+
+  - symptom: "ProgressDeadlineExceeded condition with mixed old/new pods"
+    investigation:
+      - "Check the deployment's progressDeadlineSeconds vs how long the rollout has been in progress"
+      - "Check if maxUnavailable and maxSurge settings are appropriate"
+      - "Check pod disruption budgets that might be blocking the rollout"
+    root_causes:
+      - cause: "Rollout stuck due to PodDisruptionBudget blocking old pod termination"
+        confidence_signals:
+          - "PDB exists for this workload with minAvailable close to current replica count"
+          - "New pods are Ready but old pods haven't been terminated"
+          - "Events mention 'disruption budget' or 'cannot evict'"
+        resolution_strategy: |
+          The PDB is preventing the rollout from replacing old pods.
+          This is a design conflict — escalate for human review.
+          Temporary fix: pause the rollout and manually adjust the PDB, then resume.
+
+fallback:
+  message: "Unable to determine why the deployment rollout is stuck."
+  action: "Collect deployment state and escalate."
+  collect:
+    - "Full deployment describe output"
+    - "Status of all ReplicaSets owned by the deployment"
+    - "Pod status for all pods (old and new)"
+    - "Events in the namespace from the last 30 minutes"
+    - "ResourceQuota and LimitRange in the namespace"

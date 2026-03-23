@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: k8s-runbook-agent-config
+  namespace: k8s-runbook-agent
+  labels:
+    app.kubernetes.io/name: k8s-runbook-agent
+data:
+  DRY_RUN_DEFAULT: "true"
+  LOG_LEVEL: "INFO"
+  SLACK_CHANNEL_ID: "C0123456789"
+  RUNBOOK_DIR: "/app/k8s_runbook_agent/knowledge/runbooks"

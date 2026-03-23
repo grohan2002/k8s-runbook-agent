@@ -1,0 +1,190 @@
+# RBAC for the K8s Runbook Automation Agent
+#
+# Principle of least privilege:
+#   - READ access to all workload resources (pods, deployments, events, etc.)
+#   - WRITE access limited to: deployments, statefulsets, daemonsets,
+#     configmaps, services, and pod evictions
+#   - NO access to: cluster-admin, secrets content (list only), CRDs,
+#     node modifications, or namespace mutations
+#
+# Usage:
+#   kubectl apply -f rbac.yaml
+#   # Then set the ServiceAccount on your agent Deployment
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: k8s-runbook-agent
+  namespace: k8s-runbook-agent
+  labels:
+    app.kubernetes.io/name: k8s-runbook-agent
+    app.kubernetes.io/component: rbac
+
+---
+# Read-only access across the cluster for diagnosis
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: k8s-runbook-agent-reader
+  labels:
+    app.kubernetes.io/name: k8s-runbook-agent
+    app.kubernetes.io/component: rbac
+rules:
+  # Pods: read status, logs, events
+  - apiGroups: [""]
+    resources:
+      - pods
+      - pods/status
+      - pods/log
+    verbs: ["get", "list", "watch"]
+
+  # Core resources: read for diagnosis
+  - apiGroups: [""]
+    resources:
+      - services
+      - endpoints
+      - configmaps
+      - persistentvolumeclaims
+      - serviceaccounts
+      - namespaces
+      - nodes
+      - events
+      - replicationcontrollers
+    verbs: ["get", "list", "watch"]
+
+  # Secrets: list and get metadata only (data is redacted by the agent)
+  - apiGroups: [""]
+    resources:
+      - secrets
+    verbs: ["get", "list"]
+
+  # Apps: read deployments, statefulsets, daemonsets, replicasets
+  - apiGroups: ["apps"]
+    resources:
+      - deployments
+      - deployments/status
+      - statefulsets
+      - statefulsets/status
+      - daemonsets
+      - daemonsets/status
+      - replicasets
+      - replicasets/status
+    verbs: ["get", "list", "watch"]
+
+  # Autoscaling: read HPA status
+  - apiGroups: ["autoscaling"]
+    resources:
+      - horizontalpodautoscalers
+      - horizontalpodautoscalers/status
+    verbs: ["get", "list", "watch"]
+
+  # Networking: read ingresses, network policies
+  - apiGroups: ["networking.k8s.io"]
+    resources:
+      - ingresses
+      - ingresses/status
+      - networkpolicies
+    verbs: ["get", "list", "watch"]
+
+  # Metrics: read pod and node metrics from metrics-server
+  - apiGroups: ["metrics.k8s.io"]
+    resources:
+      - pods
+      - nodes
+    verbs: ["get", "list"]
+
+---
+# Write access for approved fixes — limited to safe mutation targets
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: k8s-runbook-agent-writer
+  labels:
+    app.kubernetes.io/name: k8s-runbook-agent
+    app.kubernetes.io/component: rbac
+rules:
+  # Deployments: patch (resource limits, env, replicas), scale, rollback
+  - apiGroups: ["apps"]
+    resources:
+      - deployments
+      - deployments/scale
+    verbs: ["patch", "update"]
+
+  # StatefulSets: patch, scale
+  - apiGroups: ["apps"]
+    resources:
+      - statefulsets
+      - statefulsets/scale
+    verbs: ["patch", "update"]
+
+  # DaemonSets: patch (resource limits, node selectors)
+  - apiGroups: ["apps"]
+    resources:
+      - daemonsets
+    verbs: ["patch", "update"]
+
+  # Pods: delete (force reschedule), create evictions
+  - apiGroups: [""]
+    resources:
+      - pods
+    verbs: ["delete"]
+  - apiGroups: [""]
+    resources:
+      - pods/eviction
+    verbs: ["create"]
+
+  # ConfigMaps: create, patch (config changes)
+  - apiGroups: [""]
+    resources:
+      - configmaps
+    verbs: ["create", "patch", "update"]
+
+  # Services: create, patch (port changes, selector fixes)
+  - apiGroups: [""]
+    resources:
+      - services
+    verbs: ["create", "patch", "update"]
+
+  # Secrets: create only (Opaque type, enforced by guardrails)
+  # Agent never reads secret data — it's redacted in tool output
+  - apiGroups: [""]
+    resources:
+      - secrets
+    verbs: ["create"]
+
+---
+# Bind the reader role
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: k8s-runbook-agent-reader
+  labels:
+    app.kubernetes.io/name: k8s-runbook-agent
+    app.kubernetes.io/component: rbac
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: k8s-runbook-agent-reader
+subjects:
+  - kind: ServiceAccount
+    name: k8s-runbook-agent
+    namespace: k8s-runbook-agent
+
+---
+# Bind the writer role
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: k8s-runbook-agent-writer
+  labels:
+    app.kubernetes.io/name: k8s-runbook-agent
+    app.kubernetes.io/component: rbac
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: k8s-runbook-agent-writer
+subjects:
+  - kind: ServiceAccount
+    name: k8s-runbook-agent
+    namespace: k8s-runbook-agent

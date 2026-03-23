@@ -1,0 +1,110 @@
+apiVersion: runbook/v1
+kind: DiagnosticRunbook
+
+metadata:
+  id: pod-unschedulable
+  title: "Pod Unschedulable (Pending) Diagnosis"
+  description: "Diagnostic guide for pods stuck in Pending state — covers insufficient resources, node affinity, taints/tolerations, and PVC binding."
+  severity_signals:
+    - alertname: KubePodNotScheduled
+    - alertname: PodPending
+    - reason: Unschedulable
+    - reason: FailedScheduling
+  tags: [pod, pending, scheduling, unschedulable, affinity, taint, resources, pvc]
+
+initial_inspection:
+  - tool: get_pod_status
+    why: "Confirm the pod is in Pending phase and check conditions for scheduling errors"
+  - tool: get_events
+    args:
+      object_kind: Pod
+    why: "The FailedScheduling event contains the exact reason the scheduler couldn't place the pod"
+  - tool: get_resource_yaml
+    args:
+      kind: pod
+    why: "Read nodeSelector, affinity, tolerations, and resource requests from the pod spec"
+  - tool: list_resources
+    args:
+      kind: node
+    why: "Check all node statuses, available resources, and taints"
+  - tool: get_node_conditions
+    why: "Verify target nodes are Ready and have sufficient resources"
+
+diagnosis_tree:
+  - symptom: "FailedScheduling event mentions 'insufficient cpu' or 'insufficient memory'"
+    investigation:
+      - "Check the pod's resource requests vs what nodes have available"
+      - "Check if any nodes have room after accounting for all scheduled pods"
+      - "Check if the cluster autoscaler is enabled and if it's trying to scale up"
+      - "Check ResourceQuota in the namespace"
+    root_causes:
+      - cause: "No node has enough free resources to schedule the pod"
+        confidence_signals:
+          - "FailedScheduling mentions insufficient cpu or memory"
+          - "All nodes' allocatable minus existing pod requests < this pod's requests"
+          - "The cluster autoscaler hasn't added new nodes (disabled, at max, or quota exceeded)"
+        resolution_strategy: |
+          If the pod's resource requests are inflated, propose reducing them to match actual usage.
+          If the cluster genuinely needs more capacity, escalate for node scaling.
+          Check if there are pods that can be evicted or rescheduled to make room.
+          Mark as HIGH risk if proposing changes to resource requests.
+
+  - symptom: "FailedScheduling mentions nodeSelector or node affinity"
+    investigation:
+      - "Read the pod's spec.nodeSelector and spec.affinity.nodeAffinity"
+      - "Check which nodes match the selector/affinity requirements"
+      - "Check if matching nodes exist but are cordoned or tainted"
+    root_causes:
+      - cause: "No nodes match the pod's nodeSelector or affinity rules"
+        confidence_signals:
+          - "FailedScheduling mentions 'node(s) didn't match node selector' or 'node affinity'"
+          - "The nodeSelector references a label that no node has"
+          - "Nodes with the correct label exist but are NotReady or cordoned"
+        resolution_strategy: |
+          If the nodeSelector label is wrong or outdated, propose removing or updating it.
+          If the target nodes are cordoned, check if uncordoning is safe — escalate to operator.
+          If no nodes have the required label, the label needs to be added to appropriate nodes — escalate.
+          Mark as HUMAN_INPUT_REQUIRED — affinity rules are intentional constraints.
+
+  - symptom: "FailedScheduling mentions taints or tolerations"
+    investigation:
+      - "List taints on all nodes"
+      - "Check the pod's tolerations in its spec"
+      - "Identify which taint the pod doesn't tolerate"
+    root_causes:
+      - cause: "All suitable nodes have taints the pod doesn't tolerate"
+        confidence_signals:
+          - "FailedScheduling mentions 'node(s) had taints that the pod didn't tolerate'"
+          - "The pod has no tolerations or is missing a specific toleration"
+          - "The taint was recently added to nodes (e.g. during maintenance)"
+        resolution_strategy: |
+          Identify the specific taint and whether the pod should tolerate it.
+          If the pod should run on tainted nodes, propose adding the toleration to the deployment spec.
+          If the taint is temporary (maintenance), wait for the taint to be removed.
+          Mark as HUMAN_INPUT_REQUIRED — taints are governance controls.
+
+  - symptom: "FailedScheduling mentions volume or PVC binding"
+    investigation:
+      - "Check if the pod references a PVC and if that PVC is Bound"
+      - "If PVC is Pending, follow the pvc-pending runbook"
+      - "Check if the PVC is in a different availability zone than available nodes"
+    root_causes:
+      - cause: "Pod can't schedule because its PVC is unbound or zone-restricted"
+        confidence_signals:
+          - "FailedScheduling mentions 'node(s) had volume node affinity conflict'"
+          - "The PVC is bound to a PV in a specific AZ but no nodes are in that AZ"
+          - "The PVC is still in Pending state"
+        resolution_strategy: |
+          If the PVC is Pending, diagnose with the pvc-pending runbook first.
+          If it's a zone conflict, the pod needs to be schedulable in the PV's zone — may require node affinity adjustment.
+          Zone-bound volumes cannot be moved — escalate if the node pool in that zone is gone.
+
+fallback:
+  message: "Unable to determine why the pod cannot be scheduled."
+  action: "Collect scheduling diagnostics and escalate."
+  collect:
+    - "Pod spec with resource requests, affinity, tolerations"
+    - "FailedScheduling events with full messages"
+    - "Node list with conditions, taints, and available resources"
+    - "ResourceQuota in the namespace"
+    - "PVC status if the pod uses persistent volumes"

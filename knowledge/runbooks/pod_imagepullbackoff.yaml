@@ -1,0 +1,122 @@
+apiVersion: runbook/v1
+kind: DiagnosticRunbook
+
+metadata:
+  id: pod-imagepullbackoff
+  title: "Pod ImagePullBackOff Diagnosis"
+  description: "Diagnostic guide for pods stuck in ImagePullBackOff — covers registry auth, missing tags, network issues, and rate limiting."
+  severity_signals:
+    - alertname: KubePodImagePullBackOff
+    - alertname: KubeContainerWaiting
+    - reason: ImagePullBackOff
+    - reason: ErrImagePull
+  tags: [pod, image, pull, registry, auth, imagepullbackoff, docker, ecr, gcr, acr, tag]
+
+initial_inspection:
+  - tool: get_pod_status
+    why: "Confirm the container is in Waiting state with ImagePullBackOff reason"
+  - tool: get_events
+    why: "Get the detailed pull error message — it reveals auth failures, missing tags, or network errors"
+  - tool: get_resource_yaml
+    why: "Read the image name, tag, and imagePullSecrets configuration from the pod spec"
+
+diagnosis_tree:
+  - symptom: "Events show 'unauthorized' or 'authentication required' or '403 Forbidden'"
+    investigation:
+      - "Check if imagePullSecrets are configured in the pod spec"
+      - "If imagePullSecrets are set, verify the referenced Secret exists in the namespace"
+      - "Check the Secret type — it should be kubernetes.io/dockerconfigjson"
+      - "Check if the credentials in the Secret are for the correct registry hostname"
+      - "For ECR: check if the token has expired (ECR tokens expire every 12 hours)"
+    root_causes:
+      - cause: "Missing imagePullSecrets in pod spec"
+        confidence_signals:
+          - "The pod spec has no imagePullSecrets field"
+          - "The image is from a private registry (not docker.io/library/)"
+          - "Other pods in the same namespace pulling from the same registry have imagePullSecrets set"
+        resolution_strategy: |
+          Check if a docker-registry Secret already exists in the namespace for this registry.
+          If it exists, propose patching the Deployment to add imagePullSecrets referencing it.
+          If it doesn't exist, flag that a Secret needs to be created — the operator must provide credentials.
+          Also check if the ServiceAccount has imagePullSecrets set (kubectl get sa default -o yaml).
+      - cause: "Registry credentials expired or invalid"
+        confidence_signals:
+          - "imagePullSecrets are configured and the Secret exists"
+          - "The Secret was created or last updated long ago (check metadata.creationTimestamp)"
+          - "For ECR: the Secret contains a base64 token that expires every 12 hours"
+        resolution_strategy: |
+          For ECR: the operator needs to refresh the token using aws ecr get-login-password and update the Secret.
+          Suggest setting up an automated token refresh (CronJob or external-secrets-operator with ECR support).
+          For other registries: the operator needs to verify the credentials are still valid and update the Secret.
+          Do NOT attempt to create or modify registry credentials — flag for operator action.
+
+  - symptom: "Events show 'manifest unknown' or 'not found' or 'tag not found'"
+    investigation:
+      - "Extract the full image reference (registry/repo:tag) from the pod spec"
+      - "Check if the tag looks like a git SHA, version, or 'latest'"
+      - "Check the deployment's revision history to find the previous (working) image tag"
+      - "Check if other deployments in the namespace use images from the same registry successfully"
+    root_causes:
+      - cause: "Image tag does not exist in the registry"
+        confidence_signals:
+          - "Events explicitly mention 'manifest for <image:tag> not found'"
+          - "The tag looks like it could be a typo or a build that failed to push"
+          - "The deployment was recently updated with a new image tag"
+        resolution_strategy: |
+          Check the deployment rollout history to find the last known-good image tag.
+          Propose rolling back to the previous revision: kubectl rollout undo deployment/<name>.
+          Flag the broken tag for the CI/CD team — the image may have failed to build or push.
+          Do NOT guess what the correct tag should be.
+      - cause: "Image repository does not exist"
+        confidence_signals:
+          - "Events mention 'repository does not exist' or 'name unknown'"
+          - "The image name may have a typo in the registry or repository path"
+        resolution_strategy: |
+          Compare the image reference to working images in other deployments.
+          If the repository path looks wrong (typo, wrong org), flag for developer correction.
+          If the repository was recently deleted or migrated, escalate to the platform team.
+
+  - symptom: "Events show 'toomanyrequests' or '429' or 'rate limit exceeded'"
+    investigation:
+      - "Identify which registry is being rate-limited (Docker Hub, GHCR, etc.)"
+      - "Check how many pods are starting simultaneously (e.g., during a rollout or scale-up)"
+      - "Check if the cluster has a pull-through cache or mirror configured"
+    root_causes:
+      - cause: "Docker Hub or registry rate limiting"
+        confidence_signals:
+          - "Events mention 'toomanyrequests' from registry-1.docker.io"
+          - "Multiple pods are starting at the same time, all pulling images"
+          - "The cluster does not use authenticated Docker Hub pulls (anonymous limit is 100 pulls/6h)"
+        resolution_strategy: |
+          For Docker Hub: add Docker Hub credentials as a pull Secret to increase the rate limit.
+          Consider setting up a registry mirror or pull-through cache (Harbor, registry proxy).
+          For immediate relief: wait for the rate limit window to reset and scale up gradually.
+          Long-term: copy frequently used images to a private registry to avoid rate limits.
+
+  - symptom: "Events show network-related errors — timeout, DNS resolution failure, connection refused"
+    investigation:
+      - "Check if the node can resolve the registry hostname (DNS)"
+      - "Check if there are NetworkPolicies that might block egress to the registry"
+      - "Check if the registry URL requires a proxy and the node's proxy config"
+      - "Check if other pods on the same node can pull images successfully"
+    root_causes:
+      - cause: "Network connectivity to the registry is blocked or unavailable"
+        confidence_signals:
+          - "Events show timeout or DNS resolution errors for the registry hostname"
+          - "The node's network configuration recently changed"
+          - "Only specific nodes have this issue (node-level network problem)"
+        resolution_strategy: |
+          This is a network/infrastructure issue — escalate to the network/platform team.
+          Check if the registry requires going through a proxy (HTTP_PROXY, HTTPS_PROXY, NO_PROXY).
+          Check if a recent NetworkPolicy change is blocking egress traffic.
+          For immediate relief: if the image exists on a node already, it may be cached — try scheduling to that node.
+
+fallback:
+  message: "ImagePullBackOff confirmed but the error pattern does not match known diagnostic paths."
+  action: "Collect pull error details and escalate."
+  collect:
+    - "Full pod describe output (includes detailed pull error messages)"
+    - "All events in the namespace from the last 15 minutes"
+    - "The complete image reference from the pod spec"
+    - "imagePullSecrets configuration and referenced Secret metadata"
+    - "Node-level containerd/docker logs if accessible"

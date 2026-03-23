@@ -1,0 +1,506 @@
+"""Orchestrator — the agentic diagnosis loop.
+
+Drives Claude through a multi-turn conversation where it:
+1. Receives an alert
+2. Searches for a matching runbook
+3. Calls inspection tools to investigate the cluster
+4. Produces a structured diagnosis
+5. Proposes a fix for human approval
+
+The loop runs until Claude emits a `stop_reason: "end_turn"` (diagnosis complete),
+hits the tool-call budget, or encounters an unrecoverable error.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import re
+from typing import Any
+
+import anthropic
+
+from ..config import settings
+from ..models import Confidence, GrafanaAlert, RiskLevel
+from ..observability.logging import set_session_context
+from ..observability.metrics import (
+    anthropic_call_duration,
+    anthropic_calls,
+    diagnoses_completed,
+    diagnosis_duration,
+    escalations,
+    tokens_used,
+    tool_calls as tool_calls_metric,
+    Timer,
+)
+from .prompts import build_system_prompt, format_runbook_context
+from .session import DiagnosisSession, SessionPhase, session_store
+from .tool_registry import ToolRegistry, build_default_registry
+
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+MODEL = "claude-sonnet-4-20250514"
+MAX_TOOL_ROUNDS = 25  # Safety cap on tool-use turns (prevents runaway loops)
+MAX_TOKENS = 4096
+
+
+# ---------------------------------------------------------------------------
+# Response parsers
+# ---------------------------------------------------------------------------
+def _parse_diagnosis_block(text: str) -> dict[str, Any] | None:
+    """Extract structured diagnosis from Claude's response text."""
+    match = re.search(r"```diagnosis\s*\n(.*?)```", text, re.DOTALL)
+    if not match:
+        return None
+
+    block = match.group(1)
+    result: dict[str, Any] = {}
+
+    # ROOT_CAUSE
+    m = re.search(r"ROOT_CAUSE:\s*(.+)", block)
+    if m:
+        result["root_cause"] = m.group(1).strip()
+
+    # CONFIDENCE
+    m = re.search(r"CONFIDENCE:\s*(HIGH|MEDIUM|LOW)", block, re.IGNORECASE)
+    if m:
+        result["confidence"] = m.group(1).upper()
+
+    # EVIDENCE (multi-line list)
+    m = re.search(r"EVIDENCE:\s*\n((?:\s*-\s*.+\n?)+)", block)
+    if m:
+        result["evidence"] = [
+            line.strip().lstrip("- ") for line in m.group(1).strip().split("\n") if line.strip()
+        ]
+
+    # RULED_OUT (multi-line list)
+    m = re.search(r"RULED_OUT:\s*\n((?:\s*-\s*.+\n?)+)", block)
+    if m:
+        result["ruled_out"] = [
+            line.strip().lstrip("- ") for line in m.group(1).strip().split("\n") if line.strip()
+        ]
+
+    return result if "root_cause" in result else None
+
+
+def _parse_fix_block(text: str) -> dict[str, Any] | None:
+    """Extract structured fix proposal from Claude's response text."""
+    match = re.search(r"```fix_proposal\s*\n(.*?)```", text, re.DOTALL)
+    if not match:
+        return None
+
+    block = match.group(1)
+    result: dict[str, Any] = {}
+
+    # Simple single-line fields
+    for field in ("SUMMARY", "RISK"):
+        m = re.search(rf"{field}:\s*(.+)", block)
+        if m:
+            result[field.lower()] = m.group(1).strip()
+
+    # Multi-line fields (YAML-style block scalars)
+    for field in ("DESCRIPTION", "DRY_RUN", "ROLLBACK"):
+        m = re.search(rf"{field}:\s*\|?\s*\n((?:  .+\n?)+)", block)
+        if m:
+            # De-indent the block
+            lines = m.group(1).split("\n")
+            result[field.lower()] = "\n".join(line.strip() for line in lines if line.strip())
+
+    # HUMAN_VALUES_NEEDED list
+    m = re.search(r"HUMAN_VALUES_NEEDED:\s*\n((?:\s*-\s*.+\n?)+)", block)
+    if m:
+        result["human_values"] = [
+            line.strip().lstrip("- ") for line in m.group(1).strip().split("\n") if line.strip()
+        ]
+
+    return result if "summary" in result else None
+
+
+def _parse_escalate_block(text: str) -> dict[str, Any] | None:
+    """Extract escalation request from Claude's response text."""
+    match = re.search(r"```escalate\s*\n(.*?)```", text, re.DOTALL)
+    if not match:
+        return None
+
+    block = match.group(1)
+    m = re.search(r"REASON:\s*(.+)", block)
+    return {"reason": m.group(1).strip()} if m else {"reason": "Agent requested escalation"}
+
+
+# ---------------------------------------------------------------------------
+# Orchestrator
+# ---------------------------------------------------------------------------
+class DiagnosticOrchestrator:
+    """Drives the agentic diagnosis loop for one alert.
+
+    Usage:
+        orch = DiagnosticOrchestrator()
+        session = await orch.investigate(alert)
+        # session now contains diagnosis + fix_proposal (or escalation)
+    """
+
+    def __init__(self, registry: ToolRegistry | None = None) -> None:
+        self.client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
+        self.registry = registry or build_default_registry()
+
+    # ------------------------------------------------------------------
+    # Main entry point
+    # ------------------------------------------------------------------
+    async def investigate(self, alert: GrafanaAlert) -> DiagnosisSession:
+        """Run a full diagnosis for an alert. Returns the completed session."""
+
+        # 1. Create session
+        session = session_store.create(alert)
+        session.transition(SessionPhase.INVESTIGATING)
+
+        # Set correlation context for all logs in this investigation
+        set_session_context(
+            session_id=session.id,
+            alert_name=alert.alert_name,
+            namespace=alert.namespace,
+        )
+
+        try:
+            with Timer(diagnosis_duration):
+                # 2. Search for a matching runbook
+                runbook = await self._find_runbook(alert, session)
+                session.runbook = runbook
+
+                # 2.5. Retrieve incident memory (past similar incidents)
+                memory_text = None
+                try:
+                    from .incident_memory import incident_memory
+
+                    memory_ctx = await incident_memory.recall(alert)
+                    memory_text = incident_memory.format_for_prompt(memory_ctx)
+                    if memory_text:
+                        logger.info(
+                            "Session %s: injecting incident memory (%d similar, %d rates, %d patterns)",
+                            session.id,
+                            len(memory_ctx.similar_incidents),
+                            len(memory_ctx.fix_success_rates),
+                            len(memory_ctx.recurring_patterns),
+                        )
+                except Exception:
+                    logger.warning("Session %s: incident memory recall failed", session.id, exc_info=True)
+
+                # 3. Build system prompt
+                system_prompt = build_system_prompt(alert, runbook, memory_context=memory_text)
+
+                # 4. Seed the conversation with the alert as the first user message
+                opening_message = self._build_opening_message(alert, runbook)
+                session.add_user_message(opening_message)
+
+                # 5. Run the agentic loop
+                await self._run_loop(session, system_prompt)
+
+        except Exception as e:
+            logger.exception("Orchestrator failed for session %s", session.id)
+            session.fail(str(e))
+
+        # Record outcome metrics
+        if session.diagnosis:
+            diagnoses_completed.inc({
+                "confidence": session.diagnosis.confidence.value,
+                "alert_name": alert.alert_name,
+            })
+        if session.phase == SessionPhase.ESCALATED:
+            escalations.inc({"reason_category": "agent"})
+        if session.total_tokens_used:
+            tokens_used.inc({"model": MODEL}, value=session.total_tokens_used)
+
+        return session
+
+    # ------------------------------------------------------------------
+    # Agentic loop
+    # ------------------------------------------------------------------
+    async def _run_loop(self, session: DiagnosisSession, system_prompt: str) -> None:
+        """Multi-turn conversation loop with tool use."""
+
+        tools = self.registry.to_anthropic_tools()
+        rounds = 0
+
+        token_budget = settings.max_tokens_per_session
+
+        while rounds < MAX_TOOL_ROUNDS:
+            rounds += 1
+
+            # Conversation pruning — keep context manageable
+            if len(session.messages) > 20:
+                self._prune_conversation(session)
+
+            # Token budget check
+            if token_budget > 0 and session.total_tokens_used >= token_budget:
+                logger.warning(
+                    "Session %s: token budget exhausted (%d/%d)",
+                    session.id, session.total_tokens_used, token_budget,
+                )
+                session.escalate(
+                    f"Token budget exhausted ({session.total_tokens_used:,} / {token_budget:,} tokens). "
+                    "Escalating for manual investigation."
+                )
+                return
+
+            logger.info(
+                "Session %s: round %d/%d (%d messages)",
+                session.id, rounds, MAX_TOOL_ROUNDS, len(session.messages),
+            )
+
+            # Call Claude with retry logic + metrics
+            from .retry import AnthropicCallError, call_anthropic_with_retry
+
+            try:
+                with Timer(anthropic_call_duration):
+                    response = await call_anthropic_with_retry(
+                        self.client,
+                        model=MODEL,
+                        max_tokens=MAX_TOKENS,
+                        system=system_prompt,
+                        tools=tools,
+                        messages=session.messages,
+                    )
+                anthropic_calls.inc({"model": MODEL, "status": "ok"})
+            except AnthropicCallError as e:
+                anthropic_calls.inc({"model": MODEL, "status": "error"})
+                logger.error("Session %s: Anthropic API call failed after retries: %s", session.id, e)
+                session.escalate(f"AI service unavailable: {e}")
+                return
+
+            # Track token usage
+            session.total_tokens_used += response.usage.input_tokens + response.usage.output_tokens
+
+            # Process the response content blocks
+            assistant_content = []
+            tool_use_blocks = []
+            full_text = ""
+
+            for block in response.content:
+                if block.type == "text":
+                    full_text += block.text
+                    assistant_content.append({"type": "text", "text": block.text})
+                elif block.type == "tool_use":
+                    tool_use_blocks.append(block)
+                    assistant_content.append({
+                        "type": "tool_use",
+                        "id": block.id,
+                        "name": block.name,
+                        "input": block.input,
+                    })
+
+            # Store the assistant message
+            session.add_assistant_message(assistant_content)
+
+            # If stop_reason is "end_turn", Claude is done — parse the output
+            if response.stop_reason == "end_turn":
+                self._process_final_response(session, full_text)
+                return
+
+            # If there are tool calls, execute them and continue the loop
+            if tool_use_blocks:
+                await self._execute_tools(session, tool_use_blocks)
+            else:
+                # No tool calls and not end_turn — shouldn't happen, but handle gracefully
+                logger.warning("Session %s: unexpected stop_reason=%s", session.id, response.stop_reason)
+                self._process_final_response(session, full_text)
+                return
+
+        # Ran out of rounds
+        logger.warning("Session %s: hit MAX_TOOL_ROUNDS (%d)", session.id, MAX_TOOL_ROUNDS)
+        session.escalate(f"Investigation exceeded {MAX_TOOL_ROUNDS} tool rounds without reaching a conclusion.")
+
+    # ------------------------------------------------------------------
+    # Tool execution
+    # ------------------------------------------------------------------
+    async def _execute_tools(
+        self,
+        session: DiagnosisSession,
+        tool_use_blocks: list,
+    ) -> None:
+        """Execute tool calls and add results to the conversation."""
+
+        # Build a single user message with all tool results
+        tool_results = []
+
+        for block in tool_use_blocks:
+            logger.info(
+                "Session %s: calling tool %s with %s",
+                session.id, block.name, json.dumps(block.input, default=str)[:200],
+            )
+
+            result = await self.registry.dispatch(block.name, block.input)
+
+            # Extract text from result content blocks
+            result_text = ""
+            is_error = result.get("is_error", False)
+            for content_block in result.get("content", []):
+                if content_block.get("type") == "text":
+                    result_text += content_block["text"]
+
+            tool_results.append({
+                "type": "tool_result",
+                "tool_use_id": block.id,
+                "content": result_text,
+                "is_error": is_error,
+            })
+
+            session.tool_calls_made += 1
+            tool_calls_metric.inc({
+                "tool_name": block.name,
+                "status": "error" if is_error else "ok",
+            })
+
+            logger.debug(
+                "Session %s: tool %s returned %d chars (error=%s)",
+                session.id, block.name, len(result_text), is_error,
+            )
+
+        # Add all tool results as a single user message
+        session.messages.append({"role": "user", "content": tool_results})
+
+    # ------------------------------------------------------------------
+    # Parse final response
+    # ------------------------------------------------------------------
+    def _process_final_response(self, session: DiagnosisSession, text: str) -> None:
+        """Parse Claude's final response into structured diagnosis/fix/escalation."""
+
+        # Try to parse escalation first
+        escalate = _parse_escalate_block(text)
+        if escalate:
+            session.escalate(escalate["reason"])
+            return
+
+        # Parse diagnosis
+        diag = _parse_diagnosis_block(text)
+        if diag:
+            try:
+                confidence = Confidence(diag.get("confidence", "low").lower())
+            except ValueError:
+                confidence = Confidence.LOW
+
+            session.set_diagnosis(
+                root_cause=diag["root_cause"],
+                confidence=confidence,
+                evidence=diag.get("evidence", []),
+                ruled_out=diag.get("ruled_out", []),
+            )
+
+        # Parse fix proposal
+        fix = _parse_fix_block(text)
+        if fix:
+            try:
+                risk = RiskLevel(fix.get("risk", "high").lower())
+            except ValueError:
+                risk = RiskLevel.HIGH
+
+            human_values = fix.get("human_values", [])
+            session.set_fix_proposal(
+                summary=fix.get("summary", ""),
+                description=fix.get("description", ""),
+                risk_level=risk,
+                dry_run_output=fix.get("dry_run", ""),
+                rollback_plan=fix.get("rollback", ""),
+                requires_human_values=bool(human_values),
+                human_value_fields=human_values,
+            )
+            session.request_approval()
+
+        # If neither diagnosis nor fix was parsed, escalate
+        if not diag and not fix and not escalate:
+            logger.warning("Session %s: could not parse structured output from Claude", session.id)
+            # Store the raw text as evidence anyway
+            session.escalate(
+                "Agent completed investigation but did not produce a parseable diagnosis. "
+                "Raw output stored in conversation history."
+            )
+
+    # ------------------------------------------------------------------
+    # Runbook search
+    # ------------------------------------------------------------------
+    async def _find_runbook(self, alert: GrafanaAlert, session: DiagnosisSession):
+        """Search the knowledge base for a matching runbook."""
+        from ..tools.knowledge_base import get_store
+
+        store = get_store()
+        matches = store.search(
+            query=alert.alert_name,
+            alert_name=alert.alert_name,
+            labels=alert.labels,
+        )
+        if matches:
+            best = matches[0]
+            logger.info(
+                "Session %s: matched runbook '%s' (score=%.1f)",
+                session.id, best.runbook_id, best.score,
+            )
+            return store.get(best.runbook_id)
+        return None
+
+    # ------------------------------------------------------------------
+    # Opening message
+    # ------------------------------------------------------------------
+    def _prune_conversation(self, session: DiagnosisSession) -> None:
+        """Prune conversation history to keep context manageable.
+
+        Strategy:
+          - Keep the first 4 messages (opening context + first tool calls)
+          - Summarize middle messages into a single condensed message
+          - Keep the last 8 messages (recent investigation state)
+        """
+        msgs = session.messages
+        if len(msgs) <= 20:
+            return
+
+        keep_start = 4
+        keep_end = 8
+        middle = msgs[keep_start:-keep_end]
+
+        # Count what was in the middle
+        tool_calls = sum(
+            1 for m in middle
+            if isinstance(m.get("content"), list)
+            and any(c.get("type") == "tool_result" for c in m["content"])
+        )
+        assistant_msgs = sum(1 for m in middle if m.get("role") == "assistant")
+
+        summary = (
+            f"[CONTEXT PRUNED: {len(middle)} messages summarized — "
+            f"{tool_calls} tool results, {assistant_msgs} assistant turns. "
+            f"Key findings from earlier investigation are reflected in recent messages.]"
+        )
+
+        session.messages = (
+            msgs[:keep_start]
+            + [{"role": "user", "content": summary}]
+            + msgs[-keep_end:]
+        )
+
+        logger.info(
+            "Session %s: pruned conversation from %d to %d messages",
+            session.id, len(msgs), len(session.messages),
+        )
+
+    def _build_opening_message(self, alert: GrafanaAlert, runbook=None) -> str:
+        """Build the first user message that kicks off investigation."""
+        lines = [
+            f"A Grafana alert has fired. Please investigate and diagnose the issue.\n",
+            f"Alert: {alert.alert_name}",
+            f"Severity: {alert.severity}",
+            f"Summary: {alert.summary}",
+            f"Namespace: {alert.namespace}",
+        ]
+        if alert.pod:
+            lines.append(f"Pod: {alert.pod}")
+
+        if alert.labels:
+            lines.append(f"\nLabels: {json.dumps(alert.labels)}")
+
+        lines.append(
+            "\nStart your investigation now. Use the inspection tools to gather "
+            "evidence, then provide your diagnosis and fix proposal in the "
+            "required structured format."
+        )
+
+        return "\n".join(lines)

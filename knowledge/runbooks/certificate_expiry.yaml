@@ -1,0 +1,81 @@
+apiVersion: runbook/v1
+kind: DiagnosticRunbook
+
+metadata:
+  id: certificate-expiry
+  title: "TLS Certificate Expiring or Expired"
+  description: "Diagnostic guide for TLS certificate issues — covers cert-manager failures, expired certificates, and missing secrets."
+  severity_signals:
+    - alertname: CertificateExpiringSoon
+    - alertname: TLSCertExpiry
+    - alertname: CertManagerCertNotReady
+    - reason: CertificateExpired
+  tags: [certificate, tls, ssl, expiry, cert-manager, secret, https]
+
+initial_inspection:
+  - tool: check_resource_exists
+    args:
+      kind: secret
+    why: "Verify the TLS secret referenced by the ingress exists in the correct namespace"
+  - tool: get_events
+    why: "Check for cert-manager events — issuance errors, ACME challenge failures, or renewal issues"
+  - tool: get_ingress_status
+    why: "Check which ingress resources reference TLS and their current state"
+  - tool: describe_resource
+    args:
+      kind: secret
+    why: "Check the TLS secret metadata — creation date hints at when it was last renewed"
+
+diagnosis_tree:
+  - symptom: "TLS secret exists but certificate is expired or expiring soon"
+    investigation:
+      - "Check if cert-manager is managing this certificate (look for cert-manager annotations)"
+      - "Check if a Certificate custom resource exists for this secret"
+      - "Check cert-manager controller logs for renewal failures"
+      - "Check if the ACME issuer (Let's Encrypt) is reachable and the challenge can complete"
+    root_causes:
+      - cause: "cert-manager failed to renew — ACME challenge failure"
+        confidence_signals:
+          - "Certificate resource shows Ready=False with an ACME-related error"
+          - "Events show challenge creation or validation failures"
+          - "The domain's DNS or HTTP challenge endpoint is not accessible"
+        resolution_strategy: |
+          Check the Certificate and Challenge resources for the exact error.
+          Common causes: DNS not pointing to the cluster, firewall blocking port 80/.well-known/acme-challenge, rate limiting.
+          Escalate to platform team — cert-manager issues require infrastructure access.
+          Do NOT modify TLS secrets or certificates via automation.
+      - cause: "cert-manager not running or misconfigured"
+        confidence_signals:
+          - "cert-manager pods are not running in the cert-manager namespace"
+          - "No Certificate resources exist for the affected secret"
+          - "The secret was manually created (no cert-manager annotations)"
+        resolution_strategy: |
+          If cert-manager should be managing this cert but isn't running, escalate to platform team.
+          If the certificate was manually created, the operator needs to manually renew it.
+          Escalate immediately — expired certificates cause outages.
+
+  - symptom: "TLS secret does not exist"
+    investigation:
+      - "Check if the secret was accidentally deleted"
+      - "Check if the ingress references the correct secret name"
+      - "Check if cert-manager Certificate resource exists but hasn't created the secret yet"
+    root_causes:
+      - cause: "TLS secret deleted or never created"
+        confidence_signals:
+          - "check_resource_exists returns NOT FOUND for the secret"
+          - "The ingress references a secret name that has never existed"
+          - "No Certificate resource exists for this secret name"
+        resolution_strategy: |
+          If cert-manager should manage this, create a Certificate resource — escalate for the correct issuer and domain configuration.
+          If manually managed, the operator needs to provide the certificate and key.
+          The agent cannot create TLS secrets — escalate immediately.
+
+fallback:
+  message: "Unable to determine the certificate issue."
+  action: "Collect certificate and ingress diagnostics and escalate immediately — certificate issues cause outages."
+  collect:
+    - "TLS secret existence and metadata"
+    - "Ingress TLS configuration"
+    - "cert-manager Certificate resources (if installed)"
+    - "cert-manager controller logs"
+    - "Events in the affected namespace"

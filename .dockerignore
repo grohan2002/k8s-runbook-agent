@@ -1,0 +1,16 @@
+__pycache__
+*.pyc
+*.pyo
+.env
+.env.*
+!.env.example
+.git
+.github
+.pytest_cache
+.mypy_cache
+.ruff_cache
+tests/
+*.md
+Dockerfile
+.dockerignore
+deploy/

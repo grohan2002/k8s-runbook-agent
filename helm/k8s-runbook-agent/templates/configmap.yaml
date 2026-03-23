@@ -1,0 +1,30 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "k8s-runbook-agent.fullname" . }}-config
+  labels:
+    {{- include "k8s-runbook-agent.labels" . | nindent 4 }}
+data:
+  DRY_RUN_DEFAULT: {{ .Values.agent.dryRunDefault | quote }}
+  LOG_LEVEL: {{ .Values.agent.logLevel | quote }}
+  RUNBOOK_DIR: "/app/k8s_runbook_agent/knowledge/runbooks"
+  RUNBOOK_POLL_INTERVAL: {{ .Values.agent.runbookPollInterval | quote }}
+  MAX_TOKENS_PER_SESSION: {{ .Values.agent.maxTokensPerSession | quote }}
+  SLACK_CHANNEL_ID: {{ .Values.slack.channelId | quote }}
+  ESCALATION_SLA_CRITICAL: {{ .Values.escalation.slaCritical | quote }}
+  ESCALATION_SLA_WARNING: {{ .Values.escalation.slaWarning | quote }}
+  ESCALATION_SLA_INFO: {{ .Values.escalation.slaInfo | quote }}
+  ESCALATION_GROUP: {{ .Values.escalation.group | quote }}
+  APPROVAL_ALLOWED_USERS: {{ .Values.rbac.allowedUsers | quote }}
+  APPROVAL_ALLOWED_GROUPS: {{ .Values.rbac.allowedGroups | quote }}
+  APPROVAL_SENIOR_USERS: {{ .Values.rbac.seniorUsers | quote }}
+  APPROVAL_MIN_RISK_FOR_SENIOR: {{ .Values.rbac.minRiskForSenior | quote }}
+  INCIDENT_MEMORY_ENABLED: {{ .Values.incidentMemory.enabled | quote }}
+  INCIDENT_MEMORY_RECALL_LIMIT: {{ .Values.incidentMemory.recallLimit | quote }}
+  INCIDENT_MEMORY_RECURRING_THRESHOLD: {{ .Values.incidentMemory.recurringThreshold | quote }}
+  INCIDENT_MEMORY_RECURRING_WINDOW_DAYS: {{ .Values.incidentMemory.recurringWindowDays | quote }}
+  VOYAGE_MODEL: {{ .Values.incidentMemory.voyageModel | quote }}
+  VOYAGE_EMBEDDING_DIMS: {{ .Values.incidentMemory.voyageEmbeddingDims | quote }}
+  {{- if .Values.clusterConfigs }}
+  CLUSTER_CONFIGS: {{ .Values.clusterConfigs | quote }}
+  {{- end }}

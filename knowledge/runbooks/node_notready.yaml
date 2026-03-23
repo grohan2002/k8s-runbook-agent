@@ -1,0 +1,111 @@
+apiVersion: runbook/v1
+kind: DiagnosticRunbook
+
+metadata:
+  id: node-notready
+  title: "Node NotReady Diagnosis"
+  description: "Diagnostic guide for Kubernetes nodes in NotReady state — covers kubelet failures, resource pressure, network partitions, and runtime crashes."
+  severity_signals:
+    - alertname: KubeNodeNotReady
+    - alertname: NodeNotReady
+    - alertname: KubeNodeUnreachable
+    - reason: NodeNotReady
+  tags: [node, notready, kubelet, unreachable, drain, cordon, network]
+
+initial_inspection:
+  - tool: get_node_conditions
+    why: "Check all node conditions (Ready, MemoryPressure, DiskPressure, PIDPressure, NetworkUnavailable) and resource capacity vs allocatable"
+  - tool: list_resources
+    args:
+      kind: node
+    why: "See status of all nodes in the cluster — is this an isolated failure or a cluster-wide issue?"
+  - tool: get_events
+    args:
+      object_kind: Node
+    why: "Check for kubelet restart events, container runtime errors, or OOM events at the node level"
+  - tool: list_resources
+    args:
+      kind: pod
+      field_selector: "spec.nodeName={node_name}"
+    why: "Check how many pods are affected by this node going NotReady"
+
+diagnosis_tree:
+  - symptom: "Node condition shows MemoryPressure=True or DiskPressure=True"
+    investigation:
+      - "Check allocatable vs capacity for memory and ephemeral-storage"
+      - "List pods on the node sorted by resource usage to identify the top consumers"
+      - "Check if any pods are missing resource limits (unbounded memory consumption)"
+      - "Check for large log files or container image cache filling disk"
+    root_causes:
+      - cause: "Node memory exhaustion — too many pods or a pod with unbounded memory"
+        confidence_signals:
+          - "MemoryPressure=True in node conditions"
+          - "Allocatable memory is nearly fully consumed by pod requests"
+          - "One or more pods on the node have no memory limits set"
+        resolution_strategy: |
+          Identify pods without memory limits and propose adding resource limits.
+          If the node is genuinely overloaded, consider cordoning it and draining excess pods.
+          If it's a single pod consuming most memory, check if that pod is in CrashLoopBackOff or leaking.
+          Mark this as HIGH risk — cordoning/draining affects all pods on the node.
+      - cause: "Node disk pressure — ephemeral storage or container images filling disk"
+        confidence_signals:
+          - "DiskPressure=True in node conditions"
+          - "Events mention 'evicting pod due to disk pressure'"
+          - "Ephemeral storage usage is near the node's allocatable limit"
+        resolution_strategy: |
+          Check for pods writing large volumes of logs or temporary files.
+          Container image garbage collection may have stopped — check container runtime health.
+          This often resolves automatically once kubelet evicts pods, but the root cause (large logs, unused images) should be addressed.
+          Escalate — disk cleanup requires node-level access that the agent doesn't have.
+
+  - symptom: "Node condition Ready=Unknown or all conditions show Unknown"
+    investigation:
+      - "Check when the node was last seen as Ready (lastTransitionTime)"
+      - "Check if the kubelet process is running on the node (not directly checkable — infer from events)"
+      - "Check if other nodes on the same network segment are also NotReady (network partition)"
+      - "Check if the node was recently created or scaled (cloud autoscaler)"
+    root_causes:
+      - cause: "Kubelet has stopped reporting — process crash or OOM at the OS level"
+        confidence_signals:
+          - "All conditions show Status=Unknown"
+          - "No events from this node in the last several minutes"
+          - "Other nodes in the cluster are healthy (not a network issue)"
+        resolution_strategy: |
+          This requires node-level access to restart kubelet or investigate OS logs.
+          The agent cannot fix this directly — escalate to infrastructure team.
+          If the node is part of a cloud auto-scaling group, it may be fastest to terminate and let ASG replace it.
+          Mark affected pods for awareness — they'll be rescheduled automatically when the node is marked for deletion.
+      - cause: "Network partition between the node and the API server"
+        confidence_signals:
+          - "Multiple nodes went NotReady simultaneously"
+          - "Nodes in the same availability zone or subnet are all affected"
+          - "The node's network-related conditions show NetworkUnavailable=True"
+        resolution_strategy: |
+          This is a network infrastructure issue — not resolvable via K8s API.
+          Escalate to network/infrastructure team immediately.
+          If the partition is brief, nodes will auto-recover once connectivity restores.
+
+  - symptom: "Node shows PIDPressure=True"
+    investigation:
+      - "List pods on the node — are there an unusually large number?"
+      - "Check for pods that spawn many child processes (e.g. build jobs, test runners)"
+    root_causes:
+      - cause: "Process ID exhaustion on the node"
+        confidence_signals:
+          - "PIDPressure=True in node conditions"
+          - "Node has significantly more pods than other nodes"
+          - "Events show 'cannot allocate PID' errors"
+        resolution_strategy: |
+          Identify pods that may be spawning excessive processes.
+          Consider reducing the number of pods scheduled to this node via pod anti-affinity.
+          The node's pid_max kernel parameter may need tuning — escalate to infrastructure team.
+
+fallback:
+  message: "Unable to determine root cause for node NotReady. The condition does not match known diagnostic paths."
+  action: "Collect node-level diagnostics and escalate to infrastructure team."
+  collect:
+    - "Full node describe output"
+    - "All node conditions with timestamps"
+    - "List of all pods scheduled on the node"
+    - "Recent events mentioning this node"
+    - "Status of other nodes in the same zone"

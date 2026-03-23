@@ -1,0 +1,103 @@
+apiVersion: runbook/v1
+kind: DiagnosticRunbook
+
+metadata:
+  id: ingress-misconfigured
+  title: "Ingress Misconfiguration Diagnosis"
+  description: "Diagnostic guide for Ingress issues — covers missing backends, TLS errors, no load balancer IP, and routing mismatches."
+  severity_signals:
+    - alertname: KubeIngressNoBackend
+    - alertname: IngressError
+    - alertname: IngressNoLoadBalancerIP
+    - reason: SyncLoadBalancerFailed
+  tags: [ingress, routing, tls, certificate, loadbalancer, backend, nginx, traefik]
+
+initial_inspection:
+  - tool: get_ingress_status
+    why: "Check ingress rules, TLS configuration, backend services, and load balancer IP assignment"
+  - tool: get_endpoint_status
+    why: "Check if the backend services referenced by the ingress have ready endpoints"
+  - tool: get_events
+    args:
+      object_kind: Ingress
+    why: "Look for sync errors, TLS secret issues, or load balancer provisioning failures"
+  - tool: describe_resource
+    args:
+      kind: ingress
+    why: "Full ingress spec with annotations, rules, and default backend"
+
+diagnosis_tree:
+  - symptom: "Ingress has no load balancer IP/hostname assigned"
+    investigation:
+      - "Check if the ingress controller (nginx, traefik, ALB) is running and healthy"
+      - "Check ingress class annotation — does it match the installed controller?"
+      - "Check events for SyncLoadBalancerFailed or provisioning errors"
+      - "Check if cloud provider load balancer quota is exceeded"
+    root_causes:
+      - cause: "Ingress controller is not running or not processing this ingress"
+        confidence_signals:
+          - "Load balancer status is empty"
+          - "The ingress class annotation doesn't match any installed controller"
+          - "The ingress controller pods are not running in their namespace"
+        resolution_strategy: |
+          Check if the ingress controller deployment is healthy.
+          If the ingressClassName is wrong, propose patching it to match the installed controller.
+          If the controller is down, escalate to platform team for controller repair.
+      - cause: "Cloud load balancer provisioning failed"
+        confidence_signals:
+          - "Events show SyncLoadBalancerFailed or cloud API errors"
+          - "Cloud provider quota for load balancers may be exceeded"
+          - "The ingress controller is running but can't create the cloud LB"
+        resolution_strategy: |
+          This is a cloud infrastructure issue — escalate to platform team.
+          Check cloud provider load balancer quotas and VPC/subnet configuration.
+
+  - symptom: "Ingress routes exist but backend service has no endpoints"
+    investigation:
+      - "Check each backend service referenced in the ingress rules"
+      - "Verify the service port matches what the ingress rule specifies"
+      - "Check if the backend deployment/pods are healthy"
+    root_causes:
+      - cause: "Backend service has no ready endpoints"
+        confidence_signals:
+          - "get_endpoint_status shows 0 ready endpoints for the backend service"
+          - "The backend deployment is scaled to 0 or pods are crashing"
+          - "Traffic to this ingress rule returns 503 errors"
+        resolution_strategy: |
+          The ingress is correctly configured — the problem is the backend service.
+          Follow the service-no-endpoints runbook to diagnose why the backend has no endpoints.
+      - cause: "Ingress rule references wrong service name or port"
+        confidence_signals:
+          - "The service name in the ingress rule doesn't exist in the namespace"
+          - "The service exists but doesn't listen on the port the ingress specifies"
+          - "This was introduced by a recent ingress spec change"
+        resolution_strategy: |
+          If the service name is wrong, propose a patch to the ingress with the correct service name.
+          If the port is wrong, check the service's port list and propose the correct port number.
+          Mark as HUMAN_INPUT_REQUIRED for the correct values if multiple options exist.
+
+  - symptom: "TLS errors — certificate missing or expired"
+    investigation:
+      - "Check if the TLS secret referenced in the ingress spec exists"
+      - "Check the secret's data keys (tls.crt and tls.key should be present)"
+      - "Check if cert-manager is managing the certificate and if it's ready"
+    root_causes:
+      - cause: "TLS secret does not exist or was deleted"
+        confidence_signals:
+          - "The ingress spec references a TLS secret that doesn't exist in the namespace"
+          - "Events show 'secret not found' errors"
+          - "cert-manager Certificate resource shows NotReady status"
+        resolution_strategy: |
+          If cert-manager is used, check the Certificate resource for issuance errors.
+          If manual TLS, the operator needs to recreate the secret — escalate.
+          Do NOT create TLS secrets — the agent doesn't have certificate data.
+
+fallback:
+  message: "Unable to determine the ingress misconfiguration."
+  action: "Collect ingress and related service diagnostics and escalate."
+  collect:
+    - "Full ingress describe output"
+    - "Backend service endpoint status"
+    - "Ingress controller pod status"
+    - "TLS secret existence check"
+    - "Events in the namespace"

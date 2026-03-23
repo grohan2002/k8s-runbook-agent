@@ -1,0 +1,100 @@
+apiVersion: runbook/v1
+kind: DiagnosticRunbook
+
+metadata:
+  id: cpu-throttling
+  title: "Container CPU Throttling Diagnosis"
+  description: "Diagnostic guide for containers experiencing CPU throttling — covers limits that are too low, noisy neighbors, and burstable workload patterns."
+  severity_signals:
+    - alertname: CPUThrottlingHigh
+    - alertname: ContainerCPUThrottled
+    - alertname: KubeCPUOvercommit
+  tags: [cpu, throttling, limits, performance, latency, qos, burstable]
+
+initial_inspection:
+  - tool: get_resource_usage
+    args:
+      resource_type: pod
+    why: "Check actual CPU usage vs the pod's CPU limits to measure the throttling gap"
+  - tool: get_resource_yaml
+    args:
+      kind: deployment
+    why: "Read CPU requests and limits from the container spec"
+  - tool: get_pod_status
+    why: "Check QoS class (Guaranteed, Burstable, BestEffort) and restart history"
+  - tool: get_node_conditions
+    why: "Check if the node itself is under CPU pressure"
+  - tool: get_hpa_status
+    why: "Check if an HPA is managing this deployment and what its CPU target is"
+
+diagnosis_tree:
+  - symptom: "CPU usage consistently near or at the limit, application latency increased"
+    investigation:
+      - "Compare actual CPU usage to the CPU limit over time"
+      - "Check if the pod's QoS class is Burstable (requests < limits) or Guaranteed (requests == limits)"
+      - "Check application latency metrics if available in annotations/labels"
+      - "Check if the workload is CPU-bound (compute-heavy) or if it's a concurrency issue"
+    root_causes:
+      - cause: "CPU limit too low for the workload's normal operation"
+        confidence_signals:
+          - "CPU usage is consistently above 80% of the limit"
+          - "Application latency or response times have increased"
+          - "The CPU limit was recently reduced, or the workload increased without a corresponding limit increase"
+        resolution_strategy: |
+          Increase the CPU limit to 1.5-2x the observed P95 usage.
+          Common pattern: if usage is 450m and limit is 500m, propose limit=750m or 1000m.
+          Adjust the CPU request proportionally — keep the request:limit ratio similar.
+          If an HPA exists, coordinate the new limit with the HPA's CPU target percentage.
+          Example: limit 500m → 1000m, request 250m → 500m, HPA target stays at 70%.
+      - cause: "Workload is inherently CPU-intensive and needs architectural change"
+        confidence_signals:
+          - "CPU usage hits the limit during specific operations (batch jobs, request bursts)"
+          - "Increasing the limit just shifts the throttling point higher without solving the issue"
+          - "The workload is single-threaded and maxes out one CPU core"
+        resolution_strategy: |
+          This is an application architecture issue — increasing limits indefinitely is not sustainable.
+          Suggest the application team investigate: caching, async processing, horizontal scaling, or algorithm optimization.
+          As a temporary fix, propose increasing limits to relieve immediate pressure.
+
+  - symptom: "Pod has no CPU limits set (BestEffort QoS class)"
+    investigation:
+      - "Check if LimitRange in the namespace sets default limits"
+      - "Check if the pod is competing with other pods for CPU on the node"
+      - "Check node CPU utilization to see if the node is saturated"
+    root_causes:
+      - cause: "No CPU limits — pod can consume unlimited CPU but may be starved by others"
+        confidence_signals:
+          - "Pod QoS class is BestEffort"
+          - "No resources.limits.cpu in the container spec"
+          - "Pod performance is inconsistent (good sometimes, slow other times)"
+        resolution_strategy: |
+          Propose adding CPU limits based on observed usage patterns.
+          Check metrics-server data for the P95 CPU usage over the last hour.
+          Set limits to 2x the P95 usage as a starting point.
+          Also set CPU requests to ensure predictable scheduling.
+
+  - symptom: "HPA is at maxReplicas but pods are still throttled"
+    investigation:
+      - "Check HPA current vs desired replicas"
+      - "Check if the HPA's CPU target is being exceeded despite max replicas"
+      - "Check if maxReplicas is set too low for the current load"
+    root_causes:
+      - cause: "HPA has scaled to maximum but load exceeds capacity"
+        confidence_signals:
+          - "HPA currentReplicas == maxReplicas"
+          - "CPU utilization per pod exceeds the HPA target percentage"
+          - "The workload has grown beyond what the HPA max can handle"
+        resolution_strategy: |
+          Propose increasing the HPA maxReplicas — but mark as HUMAN_INPUT_REQUIRED.
+          The operator needs to confirm infrastructure can handle more replicas (node capacity, quotas).
+          Also consider whether per-pod CPU limits should be increased (vertical scaling) vs more replicas (horizontal scaling).
+
+fallback:
+  message: "Unable to determine the cause of CPU throttling."
+  action: "Collect resource usage data and escalate."
+  collect:
+    - "Pod resource usage from metrics-server"
+    - "Container spec with CPU requests and limits"
+    - "Node CPU utilization and capacity"
+    - "HPA status if exists"
+    - "Recent events in the namespace"

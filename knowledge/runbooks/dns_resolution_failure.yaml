@@ -1,0 +1,114 @@
+apiVersion: runbook/v1
+kind: DiagnosticRunbook
+
+metadata:
+  id: dns-resolution-failure
+  title: "DNS Resolution Failure Diagnosis"
+  description: "Diagnostic guide for DNS failures in Kubernetes — covers CoreDNS issues, service discovery failures, external DNS resolution, and ndots configuration."
+  severity_signals:
+    - alertname: CoreDNSDown
+    - alertname: DNSResolutionFailure
+    - alertname: KubeDNSLatencyHigh
+    - reason: DNSError
+  tags: [dns, coredns, resolution, service, discovery, ndots, network]
+
+initial_inspection:
+  - tool: list_resources
+    args:
+      kind: pod
+      namespace: kube-system
+      label_selector: "k8s-app=kube-dns"
+    why: "Check if CoreDNS pods are running and ready"
+  - tool: get_endpoint_status
+    args:
+      namespace: kube-system
+      service_name: kube-dns
+    why: "Check if the kube-dns service has ready endpoints"
+  - tool: get_events
+    args:
+      namespace: kube-system
+    why: "Look for CoreDNS-related events or errors"
+  - tool: get_pod_logs
+    args:
+      namespace: kube-system
+      label_selector: "k8s-app=kube-dns"
+      tail_lines: 50
+    why: "Check CoreDNS logs for resolution errors, upstream failures, or cache issues"
+
+diagnosis_tree:
+  - symptom: "CoreDNS pods are not running or not ready"
+    investigation:
+      - "Check CoreDNS deployment replica count and current ready count"
+      - "Check CoreDNS pod statuses — are they CrashLoopBackOff?"
+      - "Check CoreDNS logs for startup errors or config issues"
+      - "Check if the CoreDNS ConfigMap (coredns) exists and is valid"
+    root_causes:
+      - cause: "CoreDNS pods are crashing — misconfigured Corefile"
+        confidence_signals:
+          - "CoreDNS pods are in CrashLoopBackOff"
+          - "Logs show 'plugin/errors' or 'failed to parse Corefile'"
+          - "The CoreDNS ConfigMap was recently modified"
+        resolution_strategy: |
+          Check the 'coredns' ConfigMap in kube-system for syntax errors.
+          This is a critical cluster component — escalate to platform team immediately.
+          Do NOT modify the CoreDNS ConfigMap via automation — it affects the entire cluster.
+      - cause: "CoreDNS pods evicted or unschedulable"
+        confidence_signals:
+          - "CoreDNS pods show Pending phase"
+          - "Events show scheduling failures for CoreDNS pods"
+          - "System nodes are under resource pressure"
+        resolution_strategy: |
+          CoreDNS must run on system nodes — check for node pressure or taints blocking it.
+          Escalate immediately — DNS failure affects the entire cluster.
+
+  - symptom: "CoreDNS is running but pods cannot resolve internal service names"
+    investigation:
+      - "Check the affected pod's DNS configuration (dnsPolicy, dnsConfig)"
+      - "Check if the pod can reach the kube-dns ClusterIP (10.96.0.10 or similar)"
+      - "Check NetworkPolicy rules that might block DNS traffic (port 53 UDP/TCP)"
+      - "Check if the target service exists and has the expected name"
+    root_causes:
+      - cause: "NetworkPolicy blocking DNS traffic from the pod"
+        confidence_signals:
+          - "A NetworkPolicy exists in the pod's namespace with egress restrictions"
+          - "The egress rules don't allow port 53 UDP/TCP to kube-system"
+          - "Other pods without NetworkPolicy can resolve DNS fine"
+        resolution_strategy: |
+          Check the NetworkPolicy egress rules for the affected pod's namespace.
+          Propose adding a DNS egress rule allowing port 53 to the kube-dns service.
+          Use get_network_policy to identify the blocking policy.
+      - cause: "Pod dnsPolicy set to 'None' or 'Default' without proper dnsConfig"
+        confidence_signals:
+          - "Pod spec shows dnsPolicy: None without dnsConfig nameservers"
+          - "Pod spec shows dnsPolicy: Default (uses node DNS, not cluster DNS)"
+          - "The pod can resolve external names but not service.namespace.svc.cluster.local"
+        resolution_strategy: |
+          If dnsPolicy is None, the pod needs explicit dnsConfig with the cluster DNS IP.
+          If dnsPolicy should be ClusterFirst (normal for most pods), propose patching the deployment.
+
+  - symptom: "DNS resolution works but is very slow (high latency)"
+    investigation:
+      - "Check CoreDNS pod resource usage — is it CPU-throttled?"
+      - "Check the ndots configuration in affected pods (default is 5)"
+      - "Check if search domains are causing excessive DNS queries"
+      - "Check CoreDNS cache hit rates in logs"
+    root_causes:
+      - cause: "ndots too high — causes many unnecessary DNS queries"
+        confidence_signals:
+          - "Pod dnsConfig doesn't set ndots or sets it to 5 (default)"
+          - "Application is resolving external hostnames (api.example.com)"
+          - "Each external lookup generates 5+ queries through the search domains"
+        resolution_strategy: |
+          For pods that primarily call external services, propose setting ndots: 2 in dnsConfig.
+          This reduces unnecessary intermediate queries through the k8s search domains.
+          Alternatively, applications can use FQDNs with a trailing dot (api.example.com.) to skip search.
+
+fallback:
+  message: "Unable to determine the DNS resolution failure root cause."
+  action: "Collect DNS diagnostic data and escalate."
+  collect:
+    - "CoreDNS pod status and logs"
+    - "kube-dns service and endpoint status"
+    - "Affected pod's DNS configuration (dnsPolicy, dnsConfig)"
+    - "NetworkPolicies in the affected namespace"
+    - "CoreDNS ConfigMap"

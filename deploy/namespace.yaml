@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: k8s-runbook-agent
+  labels:
+    app.kubernetes.io/name: k8s-runbook-agent
+    app.kubernetes.io/part-of: runbook-automation

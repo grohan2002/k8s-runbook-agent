@@ -1,0 +1,119 @@
+apiVersion: runbook/v1
+kind: DiagnosticRunbook
+
+metadata:
+  id: high-error-rate
+  title: "High Error Rate / 5xx Responses"
+  description: "Diagnostic guide for services returning high rates of 5xx errors — covers application crashes, dependency failures, resource exhaustion, and config issues."
+  severity_signals:
+    - alertname: HighErrorRate
+    - alertname: HTTP5xxRateHigh
+    - alertname: ServiceErrorBudgetBurn
+    - alertname: HighLatency
+  tags: [error, 5xx, latency, http, service, upstream, downstream, timeout]
+
+initial_inspection:
+  - tool: get_pod_status
+    args:
+      label_selector: "app={service_name}"
+    why: "Check if pods are healthy — are any crashing, restarting, or not ready?"
+  - tool: get_pod_logs
+    args:
+      tail_lines: 200
+    why: "Check application logs for error patterns — stack traces, connection errors, timeouts"
+  - tool: get_endpoint_status
+    why: "Check if the service has healthy backend endpoints"
+  - tool: get_resource_usage
+    args:
+      resource_type: pod
+    why: "Check if pods are under CPU/memory pressure that could cause errors"
+  - tool: get_events
+    why: "Look for recent events — deployments, restarts, or infrastructure changes"
+
+diagnosis_tree:
+  - symptom: "Pods are restarting or in CrashLoopBackOff"
+    investigation:
+      - "Follow the pod-crashloopbackoff runbook for detailed crash diagnosis"
+      - "Check if restarts correlate with the error rate spike"
+      - "Check deployment history — was there a recent code deploy?"
+    root_causes:
+      - cause: "Application crash causing intermittent 5xx during restarts"
+        confidence_signals:
+          - "Pod restart count has increased in the last 15 minutes"
+          - "Error rate spikes correlate with pod restart timestamps"
+          - "Some pods are healthy while others are restarting"
+        resolution_strategy: |
+          The 5xx errors are a symptom of the underlying crash.
+          Follow the crashloopbackoff runbook to diagnose the crash.
+          If a recent deployment caused the crashes, propose a rollback.
+
+  - symptom: "All pods are Running+Ready but logs show connection errors to a downstream service"
+    investigation:
+      - "Identify the downstream service from error logs (hostname, URL, connection string)"
+      - "Check if the downstream service exists and has ready endpoints"
+      - "Check if NetworkPolicies might be blocking traffic between services"
+      - "Check if the downstream service's pods are healthy"
+    root_causes:
+      - cause: "Downstream dependency is down or overloaded"
+        confidence_signals:
+          - "Logs show connection refused, timeout, or 5xx from a specific downstream URL"
+          - "The downstream service has 0 ready endpoints or its pods are crashing"
+          - "Multiple upstream services show errors pointing to the same downstream"
+        resolution_strategy: |
+          The root cause is the downstream service, not this service.
+          Diagnose the downstream service — check its pod status, endpoints, and logs.
+          If the downstream is an external service (outside the cluster), escalate.
+          Consider adding circuit breakers or retry logic in the application to handle transient downstream failures.
+      - cause: "NetworkPolicy blocking inter-service communication"
+        confidence_signals:
+          - "Logs show connection refused but the downstream service is healthy"
+          - "NetworkPolicies exist in one or both namespaces"
+          - "The connection worked before a NetworkPolicy was recently added/modified"
+        resolution_strategy: |
+          Use get_network_policy to inspect policies in both the source and destination namespaces.
+          If a policy is blocking the traffic, propose adding an allow rule.
+          Mark as HUMAN_INPUT_REQUIRED — network policies are security controls.
+
+  - symptom: "Pods are healthy but CPU/memory usage is very high"
+    investigation:
+      - "Check CPU throttling — is the pod hitting its CPU limit?"
+      - "Check memory usage — is it near the OOM threshold?"
+      - "Check if the HPA is at maxReplicas"
+      - "Check if the error rate correlates with load spikes"
+    root_causes:
+      - cause: "Service is overloaded — insufficient resources or replicas"
+        confidence_signals:
+          - "CPU usage is consistently above 80% of the limit"
+          - "HPA is at maxReplicas"
+          - "Errors are timeouts or gateway timeouts (504), not application errors (500)"
+        resolution_strategy: |
+          Follow the cpu-throttling or hpa-maxed-out runbook depending on which is the bottleneck.
+          As an immediate mitigation, propose scaling up replicas or increasing CPU limits.
+
+  - symptom: "Errors started immediately after a deployment change"
+    investigation:
+      - "Check the deployment history — what changed in the latest rollout?"
+      - "Compare the new image tag to the previous one"
+      - "Check if new environment variables or config were introduced"
+      - "Check if the rollout is still in progress (partial new/old pods)"
+    root_causes:
+      - cause: "Bad deployment — new code version has a bug"
+        confidence_signals:
+          - "Error rate spiked at the exact time of the deployment"
+          - "Errors are 500 Internal Server Error (application bugs) not 503/504 (infrastructure)"
+          - "Old pods don't show the same errors in their logs"
+        resolution_strategy: |
+          Propose rolling back to the previous deployment revision.
+          Use rollback_deployment with dry_run=true to preview what will change.
+          Present the rollback as the immediate mitigation — the code bug needs developer investigation.
+
+fallback:
+  message: "Unable to determine the root cause of the high error rate."
+  action: "Collect service diagnostics and escalate for application-level investigation."
+  collect:
+    - "Pod status and recent restart history"
+    - "Application logs (last 200 lines) from multiple pods"
+    - "Endpoint status for this service and its known dependencies"
+    - "Resource usage (CPU, memory) for all pods"
+    - "Recent deployment events"
+    - "NetworkPolicies affecting this namespace"

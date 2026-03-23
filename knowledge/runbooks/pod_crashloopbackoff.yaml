@@ -1,0 +1,127 @@
+apiVersion: runbook/v1
+kind: DiagnosticRunbook
+
+metadata:
+  id: pod-crashloopbackoff
+  title: "Pod CrashLoopBackOff Diagnosis"
+  description: "Diagnostic guide for pods stuck in CrashLoopBackOff — covers OOMKilled, config errors, dependency failures, probe misconfigurations, and image issues."
+  severity_signals:
+    - alertname: KubePodCrashLooping
+    - alertname: PodCrashLoopBackOff
+    - reason: CrashLoopBackOff
+  tags: [pod, crash, restart, oomkilled, config, startup, backoff, crashloop]
+
+initial_inspection:
+  - tool: get_pod_status
+    why: "Determine current phase, restart count, and last termination reason (OOMKilled, Error, etc.)"
+  - tool: get_pod_logs
+    why: "Read application logs for errors, stack traces, or startup failures"
+    args:
+      previous: true
+      tail_lines: 150
+  - tool: get_events
+    why: "Check for scheduling failures, image pull issues, resource pressure, or probe failures"
+  - tool: get_resource_usage
+    why: "Compare actual memory/CPU usage against the container's resource limits"
+  - tool: get_resource_yaml
+    why: "Read the full pod/deployment spec to understand limits, probes, env vars, and volume mounts"
+
+diagnosis_tree:
+  - symptom: "Last termination reason is OOMKilled (exit code 137)"
+    investigation:
+      - "Check actual memory usage from metrics vs the container memory limit"
+      - "Look at usage pattern: is it consistently near the limit (too-small limit) or growing over time (memory leak)?"
+      - "Check if an HPA targets this deployment — if so, memory increase must coordinate with HPA thresholds"
+    root_causes:
+      - cause: "Memory limit too low for normal workload"
+        confidence_signals:
+          - "Peak memory usage is consistently above 80% of the limit"
+          - "No upward trend in memory usage over time — it plateaus near the limit"
+          - "The application ran fine before with a higher limit, or was recently deployed with reduced limits"
+        resolution_strategy: |
+          Increase the memory limit to 1.5x the observed peak usage. Round up to a clean value (e.g. 384Mi, 512Mi, 1Gi).
+          Adjust the memory request proportionally — keep the request:limit ratio similar to the original.
+          If an HPA exists, check that its memory target percentage still makes sense with the new limit.
+          Example: peak is 240Mi, limit is 256Mi → propose limit=384Mi, request=192Mi.
+      - cause: "Application memory leak"
+        confidence_signals:
+          - "Memory usage grows linearly or exponentially over time before each OOM"
+          - "Restart intervals are roughly periodic (leak reaches limit at a consistent rate)"
+          - "The same container version worked before — the leak may be triggered by specific workload"
+        resolution_strategy: |
+          This is an application-level bug, not a Kubernetes config issue.
+          As a temporary mitigation, increase the limit to 2x current to buy time.
+          Flag the issue for developer investigation — include the memory growth pattern as evidence.
+          If available, suggest enabling memory profiling in the application.
+
+  - symptom: "Exit code 1 with application error in logs"
+    investigation:
+      - "Read last 100-200 lines of previous container logs for error messages"
+      - "Check environment variables and configmap/secret volume mounts in the pod spec"
+      - "Verify that all referenced ConfigMaps and Secrets actually exist in the namespace"
+      - "Check if the error mentions a file path, URL, or service name that can be investigated"
+    root_causes:
+      - cause: "Missing or incorrect environment variable / ConfigMap / Secret"
+        confidence_signals:
+          - "Logs show KeyError, ENV_VAR not set, missing config, FileNotFoundError, or similar"
+          - "A ConfigMap or Secret referenced in the pod spec does not exist (check_resource_exists returns false)"
+          - "The issue started after a deployment that changed env vars or config references"
+        resolution_strategy: |
+          If a ConfigMap or Secret is missing, propose creating it with the correct name and expected keys.
+          Gather the expected key names from the pod spec (envFrom, env.valueFrom, volumeMounts).
+          Do NOT guess the actual values — mark them as HUMAN_INPUT_REQUIRED and flag for operator review.
+          If the ConfigMap exists but a specific key is missing, propose a patch to add the key.
+      - cause: "Dependency service unavailable at startup"
+        confidence_signals:
+          - "Logs show connection refused, timeout, ECONNREFUSED, DNS resolution failure, or similar"
+          - "The target host/service mentioned in logs does not have ready endpoints (check get_endpoint_status)"
+          - "The dependency pod/service was deployed after this pod, or is itself in a failure state"
+        resolution_strategy: |
+          Check if the dependency service exists and has ready endpoints.
+          If the dependency exists but has 0 ready endpoints, diagnose THAT service (recursive investigation).
+          If the dependency doesn't exist at all, this is a deployment ordering issue — escalate.
+          Consider adding an initContainer with a wait-for-service pattern if startup ordering is the root cause.
+
+  - symptom: "Exit code 137 (SIGKILL) without OOMKilled termination reason"
+    investigation:
+      - "Check for liveness probe failure events"
+      - "Inspect the liveness probe configuration (path, port, initialDelaySeconds, timeoutSeconds, periodSeconds)"
+      - "Check the container's startup time — does it exceed initialDelaySeconds?"
+      - "Check terminationGracePeriodSeconds"
+    root_causes:
+      - cause: "Liveness probe failing causes kubelet to kill the container"
+        confidence_signals:
+          - "Events show 'Liveness probe failed' or 'Killing container' messages"
+          - "The probe's initialDelaySeconds is shorter than the application's actual startup time"
+          - "The probe endpoint returns non-200 or times out during startup"
+        resolution_strategy: |
+          If initialDelaySeconds is too short, propose increasing it to at least 2x the observed startup time.
+          If the probe timeout is too short, propose increasing timeoutSeconds.
+          If available in the cluster version, suggest adding a startupProbe instead of increasing liveness delay.
+          If the probe path or port is wrong, flag for developer review — the agent cannot determine the correct endpoint.
+
+  - symptom: "Container fails to start — image-related error or exit code 127"
+    investigation:
+      - "Check events for ImagePullBackOff, ErrImagePull, or InvalidImageName"
+      - "Verify the image tag exists and the registry is accessible"
+      - "Check if imagePullSecrets are configured and the referenced Secret exists"
+    root_causes:
+      - cause: "Image tag does not exist or registry authentication failed"
+        confidence_signals:
+          - "Events show ImagePullBackOff or ErrImagePull"
+          - "The image tag was recently changed in the deployment spec"
+          - "imagePullSecrets reference a Secret that doesn't exist or has expired credentials"
+        resolution_strategy: |
+          If authentication issue: verify the imagePullSecrets Secret exists and contains valid credentials.
+          If the tag doesn't exist: check the deployment history for the last known-good image tag and propose rollback.
+          Do NOT guess image tags — present the current tag and ask the operator to confirm the correct one.
+
+fallback:
+  message: "Unable to determine root cause from automated inspection. The CrashLoopBackOff pattern does not match known diagnostic paths."
+  action: "Collect full diagnostic bundle and escalate to on-call engineer via Slack."
+  collect:
+    - "Full pod describe output"
+    - "Last 200 lines of current and previous container logs"
+    - "All events in the namespace from the last 30 minutes"
+    - "Node conditions for the pod's scheduled node"
+    - "Resource quotas and limit ranges in the namespace"

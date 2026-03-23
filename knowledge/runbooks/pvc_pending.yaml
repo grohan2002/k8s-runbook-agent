@@ -1,0 +1,93 @@
+apiVersion: runbook/v1
+kind: DiagnosticRunbook
+
+metadata:
+  id: pvc-pending
+  title: "PersistentVolumeClaim Stuck in Pending"
+  description: "Diagnostic guide for PVCs that won't bind — covers storage class issues, capacity exhaustion, access mode conflicts, and cloud provisioner failures."
+  severity_signals:
+    - alertname: KubePersistentVolumeClaimPending
+    - alertname: PVCPending
+    - alertname: VolumeProvisioningFailed
+    - reason: ProvisioningFailed
+  tags: [pvc, storage, volume, pending, bind, provisioner, storageclass]
+
+initial_inspection:
+  - tool: get_pvc_status
+    why: "Check the PVC phase (should be Pending), requested size, storage class, and access modes"
+  - tool: get_events
+    args:
+      object_kind: PersistentVolumeClaim
+    why: "Look for provisioning errors, quota exceeded, or storage class not found events"
+  - tool: describe_resource
+    args:
+      kind: pvc
+    why: "Full PVC spec including volume mode, selector, and annotations"
+  - tool: check_resource_exists
+    args:
+      kind: storageclass
+    why: "Verify the requested StorageClass exists"
+
+diagnosis_tree:
+  - symptom: "Events show 'storageclass not found' or 'no matching storage class'"
+    investigation:
+      - "Check what StorageClass the PVC requests"
+      - "List available StorageClasses in the cluster"
+      - "Check if there's a default StorageClass (annotated with storageclass.kubernetes.io/is-default-class=true)"
+    root_causes:
+      - cause: "PVC references a StorageClass that doesn't exist"
+        confidence_signals:
+          - "Events explicitly mention the storage class name as not found"
+          - "The requested storage class name has a typo or was recently deleted"
+        resolution_strategy: |
+          Check available StorageClasses and compare with the requested one.
+          If it's a typo, propose patching the PVC (requires delete + recreate since storageClassName is immutable).
+          If the StorageClass genuinely doesn't exist, escalate — creating storage classes requires cluster-admin privileges.
+
+  - symptom: "Events show provisioner errors or 'failed to provision volume'"
+    investigation:
+      - "Check the exact error message from the provisioner"
+      - "Check if the cloud provider's storage quota has been exceeded"
+      - "Check if the requested size is within the storage class's allowed range"
+      - "Check if the availability zone constraint is satisfiable"
+    root_causes:
+      - cause: "Cloud provider storage quota or capacity exhausted"
+        confidence_signals:
+          - "Provisioner error mentions 'quota exceeded' or 'insufficient capacity'"
+          - "Other PVCs in the cluster are also stuck in Pending"
+          - "The cluster is in a zone with limited storage availability"
+        resolution_strategy: |
+          This is a cloud infrastructure issue — escalate to the platform/cloud team.
+          The operator may need to increase storage quotas, choose a different availability zone, or use a different storage type.
+      - cause: "Volume size exceeds storage class limits"
+        confidence_signals:
+          - "Provisioner error mentions 'invalid disk size' or 'size out of range'"
+          - "The PVC requests an unusually large volume (e.g. >10Ti)"
+        resolution_strategy: |
+          Check the storage class parameters for size constraints.
+          Propose a smaller PVC size if the application can work with less storage.
+          If the full size is required, escalate to confirm infrastructure support.
+
+  - symptom: "PVC is waiting for a matching PV — no provisioner (WaitForFirstConsumer)"
+    investigation:
+      - "Check if the StorageClass has volumeBindingMode: WaitForFirstConsumer"
+      - "Check if a pod referencing this PVC has been created"
+      - "Check if the pod is scheduled — PV binding happens after scheduling"
+    root_causes:
+      - cause: "PVC uses WaitForFirstConsumer but no pod has been scheduled yet"
+        confidence_signals:
+          - "StorageClass volumeBindingMode is WaitForFirstConsumer"
+          - "No pod referencing this PVC exists, or the pod is in Pending state"
+        resolution_strategy: |
+          This is normal behavior for WaitForFirstConsumer — the PVC will bind once a pod using it gets scheduled.
+          If the pod can't be scheduled (see pod scheduling runbook), fix the scheduling issue first.
+          No action needed if this is just a timing issue.
+
+fallback:
+  message: "Unable to determine why the PVC is stuck in Pending."
+  action: "Collect PVC and storage diagnostics and escalate."
+  collect:
+    - "Full PVC describe output"
+    - "Available StorageClasses"
+    - "Events mentioning this PVC"
+    - "Cloud provider storage quota status"

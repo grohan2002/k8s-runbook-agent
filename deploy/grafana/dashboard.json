@@ -1,0 +1,173 @@
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "panels": [
+    {
+      "title": "Overview",
+      "type": "row",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 },
+      "collapsed": false
+    },
+    {
+      "title": "Alerts Received",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 4, "x": 0, "y": 1 },
+      "targets": [{
+        "expr": "sum(runbook_alerts_received_total)",
+        "legendFormat": "Total"
+      }],
+      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "thresholds": { "steps": [{ "value": 0, "color": "green" }] } } }
+    },
+    {
+      "title": "Active Sessions",
+      "type": "gauge",
+      "gridPos": { "h": 4, "w": 4, "x": 4, "y": 1 },
+      "targets": [{
+        "expr": "runbook_active_sessions",
+        "legendFormat": "Active"
+      }],
+      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "thresholds": { "steps": [{ "value": 0, "color": "green" }, { "value": 3, "color": "yellow" }, { "value": 5, "color": "red" }] }, "max": 10 } }
+    },
+    {
+      "title": "Diagnoses by Confidence",
+      "type": "piechart",
+      "gridPos": { "h": 4, "w": 4, "x": 8, "y": 1 },
+      "targets": [{
+        "expr": "sum by (confidence) (runbook_diagnoses_completed_total)",
+        "legendFormat": "{{confidence}}"
+      }]
+    },
+    {
+      "title": "Fixes Executed",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 4, "x": 12, "y": 1 },
+      "targets": [
+        { "expr": "sum(runbook_fixes_executed_total{status=\"success\"})", "legendFormat": "Success" },
+        { "expr": "sum(runbook_fixes_executed_total{status=\"failed\"})", "legendFormat": "Failed" }
+      ],
+      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "thresholds": { "steps": [{ "value": 0, "color": "green" }] } } }
+    },
+    {
+      "title": "Escalations",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 4, "x": 16, "y": 1 },
+      "targets": [{
+        "expr": "sum(runbook_escalations_total)",
+        "legendFormat": "Total"
+      }],
+      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "thresholds": { "steps": [{ "value": 0, "color": "green" }, { "value": 1, "color": "orange" }, { "value": 5, "color": "red" }] } } }
+    },
+    {
+      "title": "Total Tokens Used",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 4, "x": 20, "y": 1 },
+      "targets": [{
+        "expr": "sum(runbook_tokens_used_total)",
+        "legendFormat": "Tokens"
+      }],
+      "fieldConfig": { "defaults": { "unit": "short" } }
+    },
+    {
+      "title": "Throughput",
+      "type": "row",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 5 },
+      "collapsed": false
+    },
+    {
+      "title": "Alerts Received Rate",
+      "type": "timeseries",
+      "gridPos": { "h": 6, "w": 12, "x": 0, "y": 6 },
+      "targets": [{
+        "expr": "sum(rate(runbook_alerts_received_total[5m])) by (alert_name)",
+        "legendFormat": "{{alert_name}}"
+      }],
+      "fieldConfig": { "defaults": { "unit": "ops", "custom": { "drawStyle": "bars" } } }
+    },
+    {
+      "title": "Tool Calls Rate",
+      "type": "timeseries",
+      "gridPos": { "h": 6, "w": 12, "x": 12, "y": 6 },
+      "targets": [{
+        "expr": "sum(rate(runbook_tool_calls_total[5m])) by (tool_name)",
+        "legendFormat": "{{tool_name}}"
+      }],
+      "fieldConfig": { "defaults": { "unit": "ops" } }
+    },
+    {
+      "title": "Latency",
+      "type": "row",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 12 },
+      "collapsed": false
+    },
+    {
+      "title": "Diagnosis Duration (P50 / P95)",
+      "type": "timeseries",
+      "gridPos": { "h": 6, "w": 12, "x": 0, "y": 13 },
+      "targets": [
+        { "expr": "histogram_quantile(0.50, sum(rate(runbook_diagnosis_duration_seconds_bucket[5m])) by (le))", "legendFormat": "P50" },
+        { "expr": "histogram_quantile(0.95, sum(rate(runbook_diagnosis_duration_seconds_bucket[5m])) by (le))", "legendFormat": "P95" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "s" } }
+    },
+    {
+      "title": "Anthropic API Latency (P50 / P95)",
+      "type": "timeseries",
+      "gridPos": { "h": 6, "w": 12, "x": 12, "y": 13 },
+      "targets": [
+        { "expr": "histogram_quantile(0.50, sum(rate(runbook_anthropic_call_duration_seconds_bucket[5m])) by (le))", "legendFormat": "P50" },
+        { "expr": "histogram_quantile(0.95, sum(rate(runbook_anthropic_call_duration_seconds_bucket[5m])) by (le))", "legendFormat": "P95" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "s" } }
+    },
+    {
+      "title": "Errors & Health",
+      "type": "row",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 19 },
+      "collapsed": false
+    },
+    {
+      "title": "Anthropic API Errors",
+      "type": "timeseries",
+      "gridPos": { "h": 6, "w": 8, "x": 0, "y": 20 },
+      "targets": [{
+        "expr": "sum(rate(runbook_anthropic_calls_total{status=\"error\"}[5m]))",
+        "legendFormat": "Errors/s"
+      }],
+      "fieldConfig": { "defaults": { "unit": "ops", "color": { "mode": "fixed", "fixedColor": "red" } } }
+    },
+    {
+      "title": "Tool Errors by Tool",
+      "type": "timeseries",
+      "gridPos": { "h": 6, "w": 8, "x": 8, "y": 20 },
+      "targets": [{
+        "expr": "sum(rate(runbook_tool_calls_total{status=\"error\"}[5m])) by (tool_name)",
+        "legendFormat": "{{tool_name}}"
+      }],
+      "fieldConfig": { "defaults": { "unit": "ops" } }
+    },
+    {
+      "title": "Escalations by Reason",
+      "type": "timeseries",
+      "gridPos": { "h": 6, "w": 8, "x": 16, "y": 20 },
+      "targets": [{
+        "expr": "sum(rate(runbook_escalations_total[5m])) by (reason_category)",
+        "legendFormat": "{{reason_category}}"
+      }],
+      "fieldConfig": { "defaults": { "unit": "ops" } }
+    }
+  ],
+  "schemaVersion": 39,
+  "tags": ["kubernetes", "runbook-agent", "ai"],
+  "templating": { "list": [] },
+  "time": { "from": "now-6h", "to": "now" },
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "K8s Runbook Agent",
+  "uid": "k8s-runbook-agent",
+  "version": 1,
+  "refresh": "30s"
+}

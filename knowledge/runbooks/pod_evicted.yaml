@@ -1,0 +1,101 @@
+apiVersion: runbook/v1
+kind: DiagnosticRunbook
+
+metadata:
+  id: pod-evicted
+  title: "Pod Evicted Diagnosis"
+  description: "Diagnostic guide for pod evictions — covers resource pressure evictions, preemption, taint-based evictions, and node drains."
+  severity_signals:
+    - alertname: KubePodEvicted
+    - alertname: PodEvictionAlert
+    - reason: Evicted
+    - reason: Preempted
+  tags: [pod, eviction, evicted, preemption, taint, drain, resources, qos]
+
+initial_inspection:
+  - tool: get_pod_status
+    why: "Check the eviction reason and message in the pod status"
+  - tool: get_events
+    why: "Look for eviction events with the specific reason (resource pressure, preemption, taint)"
+  - tool: get_node_conditions
+    why: "Check if the node had resource pressure at the time of eviction"
+  - tool: get_resource_usage
+    args:
+      resource_type: node
+    why: "Check node-level resource usage at the time of eviction"
+
+diagnosis_tree:
+  - symptom: "Eviction message mentions 'ephemeral-local-storage' or disk pressure"
+    investigation:
+      - "Check node DiskPressure condition"
+      - "Check the pod's ephemeral storage usage and limits"
+      - "Check if the pod was writing large log files or temp data"
+      - "Check container image sizes on the node"
+    root_causes:
+      - cause: "Pod exceeded its ephemeral storage limit"
+        confidence_signals:
+          - "Eviction message mentions ephemeral-local-storage"
+          - "The pod had ephemeral-storage limits set and exceeded them"
+          - "The pod writes large volumes of temporary data or logs"
+        resolution_strategy: |
+          If the pod genuinely needs more ephemeral storage, propose increasing the limit.
+          If the pod is writing excessive logs, suggest log rotation or reducing log verbosity.
+          If the pod writes temp data, consider mounting an emptyDir with a sizeLimit or using a PVC.
+      - cause: "Node-level disk pressure caused kubelet to evict BestEffort/Burstable pods"
+        confidence_signals:
+          - "Node shows DiskPressure=True"
+          - "Multiple pods were evicted from the same node"
+          - "The evicted pod had QoS class BestEffort or Burstable"
+        resolution_strategy: |
+          BestEffort and Burstable pods are evicted first during resource pressure.
+          To prevent eviction, set resource requests=limits (Guaranteed QoS class).
+          Address the underlying disk pressure — check for log accumulation, unused images.
+          Escalate for node-level disk cleanup.
+
+  - symptom: "Eviction message mentions memory or the pod was OOMKilled before eviction"
+    investigation:
+      - "Check node MemoryPressure condition"
+      - "Check the pod's memory usage vs its request/limit"
+      - "Check if other pods on the same node are using excessive memory"
+    root_causes:
+      - cause: "Node memory pressure caused eviction of low-priority pods"
+        confidence_signals:
+          - "Node shows MemoryPressure=True"
+          - "The evicted pod had low QoS class or no resource requests"
+          - "Other pods on the node have high memory usage"
+        resolution_strategy: |
+          Set proper memory requests and limits to improve QoS class.
+          Pods with Guaranteed QoS (requests == limits) are evicted last.
+          If the pod already has Guaranteed QoS, the node may be overcommitted — consider spreading pods across nodes with anti-affinity.
+
+  - symptom: "Pod evicted due to taint NoExecute or node drain"
+    investigation:
+      - "Check node taints — was a NoExecute taint added?"
+      - "Check if the node was cordoned (unschedulable=true)"
+      - "Check if a cluster upgrade or scaling event triggered a drain"
+    root_causes:
+      - cause: "Node was drained for maintenance or scaling"
+        confidence_signals:
+          - "Node shows Unschedulable=True (cordoned)"
+          - "Events show 'Taint manager: deleting pod' or drain-related messages"
+          - "This coincides with a known maintenance window or cluster upgrade"
+        resolution_strategy: |
+          This is expected behavior during maintenance. The pod should be rescheduled to another node.
+          If the pod was NOT rescheduled, check for scheduling issues (insufficient capacity, node affinity).
+          No fix needed unless the pod can't find a new node.
+      - cause: "Pod does not tolerate a required taint"
+        confidence_signals:
+          - "The node has a taint that the pod doesn't tolerate"
+          - "Events show 'Taint was updated' followed by eviction"
+        resolution_strategy: |
+          Add the appropriate toleration to the pod spec if it should run on tainted nodes.
+          Mark as HUMAN_INPUT_REQUIRED — taints are governance controls and shouldn't be overridden without review.
+
+fallback:
+  message: "Unable to determine the cause of pod eviction."
+  action: "Collect pod and node diagnostics and escalate."
+  collect:
+    - "Full pod status with eviction reason"
+    - "Node conditions and taints"
+    - "Node resource usage from metrics-server"
+    - "Events in the namespace from the last 30 minutes"

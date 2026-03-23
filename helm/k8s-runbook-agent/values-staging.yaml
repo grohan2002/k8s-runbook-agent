@@ -1,0 +1,17 @@
+# Staging overrides
+agent:
+  dryRunDefault: true
+  logLevel: DEBUG
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi
+
+escalation:
+  slaCritical: 600    # 10 min (relaxed for staging)
+  slaWarning: 1800    # 30 min
+  slaInfo: 7200       # 2 hr

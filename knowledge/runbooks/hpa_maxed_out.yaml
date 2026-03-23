@@ -1,0 +1,95 @@
+apiVersion: runbook/v1
+kind: DiagnosticRunbook
+
+metadata:
+  id: hpa-maxed-out
+  title: "HPA at Maximum Replicas"
+  description: "Diagnostic guide for HorizontalPodAutoscalers stuck at maxReplicas — covers insufficient capacity, metric collection issues, and scaling ceiling problems."
+  severity_signals:
+    - alertname: KubeHpaMaxedOut
+    - alertname: HPAMaxReplicas
+    - alertname: KubeHpaReplicasMismatch
+  tags: [hpa, autoscaler, scaling, maxreplicas, capacity, metrics]
+
+initial_inspection:
+  - tool: get_hpa_status
+    why: "Check current vs desired replicas, metric values, and scaling conditions"
+  - tool: describe_resource
+    args:
+      kind: deployment
+    why: "Check the target deployment's current state and resource specs"
+  - tool: get_resource_usage
+    args:
+      resource_type: pod
+    why: "Check actual CPU/memory usage per pod to verify metrics are accurate"
+  - tool: get_events
+    why: "Look for FailedGetResourceMetric, FailedComputeReplicas, or scaling events"
+
+diagnosis_tree:
+  - symptom: "HPA currentReplicas == maxReplicas and CPU/memory metric exceeds target"
+    investigation:
+      - "Check the absolute load — is this a genuine traffic increase or a spike?"
+      - "Check if the maxReplicas value is reasonable for the cluster capacity"
+      - "Check node resource availability — can the cluster even host more pods?"
+      - "Check if the application is degrading under load (response times, error rates)"
+    root_causes:
+      - cause: "Genuine load increase exceeding HPA's maxReplicas capacity"
+        confidence_signals:
+          - "CPU/memory utilization per pod exceeds the HPA target (e.g. 85% vs target 70%)"
+          - "The load pattern correlates with expected traffic (business hours, marketing event)"
+          - "Nodes have capacity to host additional pods"
+        resolution_strategy: |
+          Propose increasing maxReplicas — mark as HUMAN_INPUT_REQUIRED.
+          Before increasing, verify cluster has enough node capacity for the additional pods.
+          If nodes are also near capacity, the operator needs to add nodes first.
+          Suggest a reasonable maxReplicas increase (e.g. 1.5x current max) rather than an arbitrary large number.
+      - cause: "Per-pod resource efficiency is poor — scaling out doesn't help linearly"
+        confidence_signals:
+          - "Adding more replicas doesn't reduce per-pod CPU/memory proportionally"
+          - "The bottleneck may be external (database connections, downstream rate limits)"
+          - "Request latency doesn't improve with more replicas"
+        resolution_strategy: |
+          Horizontal scaling has diminishing returns when the bottleneck is external.
+          Investigate the application's dependencies — database, cache, external APIs.
+          Consider vertical scaling (bigger per-pod limits) or application-level optimization.
+          Escalate for application architecture review.
+
+  - symptom: "HPA shows FailedGetResourceMetric or AbleToScale=False"
+    investigation:
+      - "Check if metrics-server is running and healthy"
+      - "Check if the HPA can read metrics (conditions section)"
+      - "Verify the target resource (e.g. deployment) exists and has the expected labels"
+    root_causes:
+      - cause: "Metrics-server is down or not returning metrics for these pods"
+        confidence_signals:
+          - "HPA conditions show AbleToScale=False or ScalingActive=False"
+          - "Events show FailedGetResourceMetric or FailedComputeMetricsReplicas"
+          - "get_resource_usage returns 'metrics not available'"
+        resolution_strategy: |
+          Check metrics-server deployment in kube-system namespace.
+          This is a cluster infrastructure issue — escalate to platform team.
+          The HPA will resume normal operation once metrics are available again.
+
+  - symptom: "Desired replicas < maxReplicas but HPA won't scale up"
+    investigation:
+      - "Check HPA stabilization window (behavior.scaleUp settings)"
+      - "Check if there's a scale-up cooldown preventing immediate scaling"
+      - "Check if pods are being created but can't be scheduled"
+    root_causes:
+      - cause: "HPA scaleUp stabilization window is preventing rapid scaling"
+        confidence_signals:
+          - "HPA behavior.scaleUp.stabilizationWindowSeconds is large (>120s)"
+          - "The load spike is recent and within the stabilization window"
+        resolution_strategy: |
+          This is working as designed — the stabilization window prevents thrashing.
+          If the window is too conservative for the workload, propose a patch to reduce it.
+          Consider adding a more aggressive scaleUp policy for sudden spikes.
+
+fallback:
+  message: "Unable to determine why the HPA is at maximum replicas."
+  action: "Collect HPA and deployment diagnostics and escalate."
+  collect:
+    - "Full HPA describe output with conditions"
+    - "Deployment current state and resource specs"
+    - "Pod resource usage from metrics-server"
+    - "Node capacity and allocatable resources"

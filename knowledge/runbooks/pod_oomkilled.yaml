@@ -1,0 +1,121 @@
+apiVersion: runbook/v1
+kind: DiagnosticRunbook
+
+metadata:
+  id: pod-oomkilled
+  title: "Pod OOMKilled Diagnosis"
+  description: "Dedicated diagnostic guide for OOMKilled pods — distinguishes between limit misconfiguration, memory leaks, JVM heap issues, and node-level memory pressure."
+  severity_signals:
+    - alertname: KubeContainerOOMKilled
+    - alertname: KubePodOOMKilled
+    - reason: OOMKilled
+  tags: [pod, oom, oomkilled, memory, limit, heap, jvm, leak, resources]
+
+initial_inspection:
+  - tool: get_pod_status
+    why: "Confirm OOMKilled as the termination reason and get restart count and timing"
+  - tool: get_pod_logs
+    why: "Look for memory-related errors — Java OutOfMemoryError, Go runtime OOM, Python MemoryError, etc."
+    args:
+      previous: true
+      tail_lines: 100
+  - tool: get_resource_usage
+    why: "Get current memory usage and compare to container memory limit"
+  - tool: get_resource_yaml
+    why: "Read the container's resources.limits.memory and resources.requests.memory"
+  - tool: get_events
+    why: "Check frequency of OOMKilled events — is it every few minutes or sporadic?"
+  - tool: get_node_conditions
+    why: "Check if the node itself is under memory pressure (MemoryPressure condition)"
+
+diagnosis_tree:
+  - symptom: "Container memory limit is set and usage is consistently near the limit"
+    investigation:
+      - "Compare peak memory usage (from metrics) to the memory limit"
+      - "Calculate utilization percentage: usage / limit * 100"
+      - "Check if the limit was recently changed (get deployment revision history)"
+      - "Check if an HPA exists targeting this workload"
+      - "For JVM workloads: check if -Xmx is set and how it compares to the container limit"
+    root_causes:
+      - cause: "Container memory limit set too low for workload requirements"
+        confidence_signals:
+          - "Memory utilization is above 85% of the limit"
+          - "The application's memory usage is stable (not growing) before hitting the wall"
+          - "The limit was recently reduced, or the workload recently increased (more traffic, larger data)"
+        resolution_strategy: |
+          Increase the memory limit. Recommended formula: new_limit = observed_peak * 1.5, rounded up.
+          Adjust memory request proportionally (maintain the original request:limit ratio).
+          For JVM applications: ensure -Xmx is set to about 75% of the container limit to leave room for
+          non-heap memory (metaspace, thread stacks, direct buffers, native libs).
+          Example: if limit=512Mi, set -Xmx=384m. If increasing limit to 768Mi, set -Xmx=576m.
+          If an HPA exists, verify the memory utilization target still makes sense.
+      - cause: "JVM heap misconfiguration"
+        confidence_signals:
+          - "Application is Java-based (logs show java. stack traces or JVM startup messages)"
+          - "-Xmx is not set (JVM uses 25% of container memory by default) or is set higher than the container limit"
+          - "Logs show java.lang.OutOfMemoryError: Java heap space"
+        resolution_strategy: |
+          Set -Xmx explicitly to 75% of the container memory limit.
+          If using container-aware JVM (Java 10+), ensure -XX:+UseContainerSupport is enabled.
+          Prefer -XX:MaxRAMPercentage=75.0 over a fixed -Xmx so it scales with the container limit.
+          Apply via environment variable JAVA_TOOL_OPTIONS or the application's JVM args configuration.
+
+  - symptom: "Memory usage grows over time until OOMKilled"
+    investigation:
+      - "Look at the time between restarts — if consistent, calculate the memory growth rate"
+      - "Check if the memory growth pattern is linear (constant leak) or exponential (unbounded caching)"
+      - "Look at logs for warnings about cache sizes, connection pool growth, or buffer accumulation"
+      - "Check if the issue correlates with traffic patterns or specific request types"
+    root_causes:
+      - cause: "Application memory leak"
+        confidence_signals:
+          - "Memory grows linearly from a baseline to the limit before each OOM"
+          - "Restart intervals are roughly consistent (e.g., every 2 hours)"
+          - "The issue started with a specific application version (check image tag history)"
+          - "No change in traffic volume that would explain increased memory usage"
+        resolution_strategy: |
+          This is an application bug — Kubernetes config changes are only a temporary mitigation.
+          Temporary: increase memory limit to 2x current to extend the time between OOMs.
+          Flag for developer investigation with evidence: memory growth rate, restart frequency, and the
+          application version when the issue started.
+          Suggest the developer enable memory profiling (pprof for Go, JFR for Java, tracemalloc for Python).
+      - cause: "Unbounded caching or connection pool growth"
+        confidence_signals:
+          - "Logs mention cache sizes, pool sizes, or buffer counts growing"
+          - "Memory growth correlates with request volume"
+          - "The application has in-memory caching without eviction policies"
+        resolution_strategy: |
+          If the application has configurable cache limits, propose setting them via env vars or ConfigMap.
+          If connection pool sizes are unbounded, propose setting max pool size configuration.
+          These are application-level changes — flag specific config keys for the developer.
+          Temporary: increase memory limit and set up monitoring to track when the issue recurs.
+
+  - symptom: "Node is under MemoryPressure"
+    investigation:
+      - "Check node conditions for MemoryPressure=True"
+      - "List all pods on the node and their memory usage"
+      - "Check if there are pods without memory limits (best-effort QoS) consuming excess memory"
+      - "Check node allocatable memory vs total requested by all pods"
+    root_causes:
+      - cause: "Node overcommitted — total pod requests exceed node capacity"
+        confidence_signals:
+          - "Sum of all pod memory requests on the node exceeds node allocatable memory"
+          - "Multiple pods on the node are being OOMKilled, not just one"
+          - "The node has MemoryPressure=True condition"
+        resolution_strategy: |
+          This is a cluster capacity issue, not a single-pod issue.
+          Check if the cluster autoscaler is enabled and if it can add nodes.
+          If autoscaler is stuck, check for PodDisruptionBudgets or node affinity rules blocking scaling.
+          Consider cordoning the node and letting pods reschedule to healthier nodes.
+          For immediate relief: identify pods without memory limits and propose adding limits.
+          Escalate to the platform team for capacity planning.
+
+fallback:
+  message: "OOMKilled confirmed but the root cause pattern does not match known diagnostic paths."
+  action: "Collect memory diagnostics and escalate."
+  collect:
+    - "Pod describe output with full resource specs"
+    - "Last 200 lines of logs (current and previous container)"
+    - "Memory usage time series if available from metrics"
+    - "Node conditions and resource utilization"
+    - "All pods on the same node with their resource usage"

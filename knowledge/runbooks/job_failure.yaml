@@ -1,0 +1,111 @@
+apiVersion: runbook/v1
+kind: DiagnosticRunbook
+
+metadata:
+  id: job-failure
+  title: "Job/CronJob Failure Diagnosis"
+  description: "Diagnostic guide for failed Kubernetes Jobs and CronJobs — covers backoff limits, deadline exceeded, OOMKilled jobs, and stuck completions."
+  severity_signals:
+    - alertname: KubeJobFailed
+    - alertname: KubeJobNotCompleted
+    - alertname: CronJobSuspended
+    - reason: BackoffLimitExceeded
+    - reason: DeadlineExceeded
+  tags: [job, cronjob, batch, failure, backoff, deadline, completion]
+
+initial_inspection:
+  - tool: describe_resource
+    args:
+      kind: job
+    why: "Check job conditions (Complete/Failed), completion counts, and backoff limit"
+  - tool: get_pod_status
+    args:
+      label_selector: "job-name={job_name}"
+    why: "Check the status of pods created by this job — did they OOM, crash, or timeout?"
+  - tool: get_pod_logs
+    args:
+      previous: true
+    why: "Get logs from the failed job pod to see the error"
+  - tool: get_events
+    args:
+      object_kind: Job
+    why: "Check for BackoffLimitExceeded, DeadlineExceeded, or FailedCreate events"
+
+diagnosis_tree:
+  - symptom: "Job condition shows Failed with reason BackoffLimitExceeded"
+    investigation:
+      - "Check how many times the job pod was retried (job.status.failed count)"
+      - "Check the backoffLimit setting in the job spec"
+      - "Get logs from the most recent failed pod to see the consistent error"
+      - "Check if the error is the same on every retry (deterministic failure)"
+    root_causes:
+      - cause: "Job consistently fails with an application error"
+        confidence_signals:
+          - "All pod attempts show the same error in logs"
+          - "The failure is deterministic (not a transient issue)"
+          - "Exit code is non-zero (1, 2, etc.) not OOMKilled (137)"
+        resolution_strategy: |
+          This is an application bug in the job logic — not a K8s config issue.
+          Present the log output and error messages to the operator.
+          Escalate for developer investigation — the agent cannot fix application logic.
+          If the error is about missing config/secrets, follow the crashloopbackoff runbook's config section.
+      - cause: "Job pods are OOMKilled on every attempt"
+        confidence_signals:
+          - "Pod termination reason is OOMKilled on every retry"
+          - "Exit code 137 consistently"
+          - "The job processes large data sets that exceed the memory limit"
+        resolution_strategy: |
+          Increase the memory limit for the job's pod template.
+          Jobs often process larger data volumes than regular pods — set limits based on expected peak.
+          If the job is a CronJob, update the CronJob's jobTemplate spec.
+
+  - symptom: "Job condition shows Failed with reason DeadlineExceeded"
+    investigation:
+      - "Check the job's activeDeadlineSeconds setting"
+      - "Check how long the job pod actually ran before being killed"
+      - "Check if the job is doing I/O operations that could be slow (network, disk)"
+    root_causes:
+      - cause: "Job takes longer than its activeDeadlineSeconds"
+        confidence_signals:
+          - "Job has activeDeadlineSeconds set and the pod ran for exactly that duration"
+          - "Pod logs show the job was making progress but didn't finish in time"
+          - "The data volume or processing load has increased since the deadline was set"
+        resolution_strategy: |
+          Propose increasing activeDeadlineSeconds to accommodate the current workload.
+          Set it to 2x the observed completion time of successful runs.
+          If the job has never completed, escalate — it may be stuck in an infinite loop.
+
+  - symptom: "CronJob has not run recently or shows suspended=true"
+    investigation:
+      - "Check the CronJob's suspend field"
+      - "Check the CronJob's schedule expression and last scheduled time"
+      - "Check if the CronJob's concurrencyPolicy is blocking new runs"
+      - "Check the CronJob's startingDeadlineSeconds"
+    root_causes:
+      - cause: "CronJob is suspended"
+        confidence_signals:
+          - "CronJob spec.suspend is true"
+          - "No jobs have been created recently"
+          - "The CronJob was manually suspended"
+        resolution_strategy: |
+          If the suspension is intentional, no action needed.
+          If it should be running, propose unsuspending it by patching suspend=false.
+          Mark as HUMAN_INPUT_REQUIRED — suspensions are usually deliberate.
+      - cause: "CronJob concurrencyPolicy=Forbid and previous job still running"
+        confidence_signals:
+          - "CronJob concurrencyPolicy is Forbid"
+          - "An active Job from a previous schedule is still running"
+          - "The running job is stuck or taking longer than expected"
+        resolution_strategy: |
+          Check why the previous job is still running — it may be stuck.
+          If the previous job is stuck, consider deleting it to unblock the CronJob.
+          If jobs consistently overrun their schedule, consider increasing resources or adjusting the schedule.
+
+fallback:
+  message: "Unable to determine why the job failed."
+  action: "Collect job and pod diagnostics and escalate."
+  collect:
+    - "Full job describe output with conditions"
+    - "Pod logs from the most recent failed attempt"
+    - "Events related to the job"
+    - "Job spec including backoffLimit, activeDeadlineSeconds, and resource limits"

@@ -162,6 +162,19 @@ def evaluate_guardrails(session: DiagnosisSession) -> GuardrailResult:
                 "Diagnosis confidence is MEDIUM. Verify the evidence before approving."
             )
 
+    # 9. Composite fix confidence check
+    if session.fix_confidence is not None:
+        if session.fix_confidence.score < 0.3:
+            result.block(
+                f"Fix confidence score is {session.fix_confidence.percentage}% "
+                f"(below 30% threshold). Blocked from auto-execution."
+            )
+        elif session.fix_confidence.score < 0.5:
+            result.warn(
+                f"Fix confidence score is {session.fix_confidence.percentage}%. "
+                f"Review evidence carefully before approving."
+            )
+
     return result
 
 

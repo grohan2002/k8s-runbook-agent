@@ -107,6 +107,31 @@ class MemoryContext:
         return bool(self.similar_incidents or self.fix_success_rates or self.recurring_patterns)
 
 
+@dataclass
+class FixConfidence:
+    """Composite confidence score for a proposed fix."""
+
+    score: float              # 0.0 to 1.0
+    diagnosis_weight: float   # weighted diagnosis confidence contribution
+    history_weight: float     # weighted fix success rate contribution
+    evidence_weight: float    # weighted evidence count contribution
+    fix_success_rate: float   # raw rate from history (0.0 if no history)
+    fix_success_count: int
+    fix_total_count: int
+    has_history: bool
+
+    @property
+    def percentage(self) -> int:
+        return round(self.score * 100)
+
+    def display_str(self, diagnosis_confidence_label: str) -> str:
+        parts = [f"{self.percentage}%"]
+        if self.has_history:
+            parts.append(f"{self.fix_success_count}/{self.fix_total_count} past successes")
+        parts.append(f"{diagnosis_confidence_label.upper()} diagnosis confidence")
+        return ", ".join(parts)
+
+
 # ---------------------------------------------------------------------------
 # Incident Memory
 # ---------------------------------------------------------------------------
@@ -350,6 +375,79 @@ class IncidentMemory:
         elif phase == SessionPhase.FAILED:
             return "failed"
         return "unknown"
+
+
+    async def get_fix_confidence(
+        self,
+        alert_name: str,
+        fix_summary: str,
+        diagnosis_confidence: "Confidence",
+        evidence_count: int,
+    ) -> FixConfidence:
+        """Calculate composite confidence for a proposed fix.
+
+        Formula: (diagnosis_numeric * 0.4) + (fix_success_rate * 0.4) + (evidence_normalized * 0.2)
+        """
+        from ..models import Confidence
+
+        conf_map = {Confidence.HIGH: 1.0, Confidence.MEDIUM: 0.6, Confidence.LOW: 0.3}
+        diag_numeric = conf_map.get(diagnosis_confidence, 0.3)
+
+        # Normalize evidence count (5+ items = full score)
+        evidence_normalized = min(evidence_count / 5.0, 1.0)
+
+        # Query historical fix success rate
+        fix_rate = 0.5  # neutral default when no history
+        fix_success_count = 0
+        fix_total_count = 0
+        has_history = False
+
+        if settings.incident_memory_enabled:
+            try:
+                from ..db import get_pool
+
+                pool = get_pool()
+                if pool:
+                    rows = await pool.fetch(
+                        """
+                        SELECT fix_summary,
+                               COUNT(*) as total,
+                               COUNT(*) FILTER (WHERE outcome = 'success') as successes
+                        FROM incident_memory
+                        WHERE alert_name = $1
+                        GROUP BY fix_summary
+                        """,
+                        alert_name,
+                    )
+                    for row in rows:
+                        row_summary = row["fix_summary"] or ""
+                        if (fix_summary.lower() in row_summary.lower()
+                                or row_summary.lower() in fix_summary.lower()):
+                            total = row["total"]
+                            successes = row["successes"]
+                            fix_rate = successes / total if total > 0 else 0.5
+                            fix_success_count = successes
+                            fix_total_count = total
+                            has_history = True
+                            break
+            except Exception:
+                logger.debug("Fix confidence DB query failed", exc_info=True)
+
+        diag_weight = diag_numeric * 0.4
+        history_weight = fix_rate * 0.4
+        evidence_weight = evidence_normalized * 0.2
+        score = diag_weight + history_weight + evidence_weight
+
+        return FixConfidence(
+            score=score,
+            diagnosis_weight=diag_weight,
+            history_weight=history_weight,
+            evidence_weight=evidence_weight,
+            fix_success_rate=fix_rate,
+            fix_success_count=fix_success_count,
+            fix_total_count=fix_total_count,
+            has_history=has_history,
+        )
 
 
 # Module-level singleton

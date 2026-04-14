@@ -293,9 +293,32 @@ class DiagnosticOrchestrator:
             # Store the assistant message
             session.add_assistant_message(assistant_content)
 
-            # If stop_reason is "end_turn", Claude is done — parse the output
+            # If stop_reason is "end_turn", Claude is done — but enforce tool calls first
             if response.stop_reason == "end_turn":
+                enforcement_rounds = getattr(session, "_enforcement_rounds", 0)
+                if enforcement_rounds < 3:
+                    from .multi_agent.tool_subsets import check_required_tools_met, MAX_ENFORCEMENT_ROUNDS
+                    met, missing = check_required_tools_met(None, session.tools_called)
+                    if not met:
+                        session._enforcement_rounds = enforcement_rounds + 1
+                        from ..observability.metrics import enforcement_triggered
+                        enforcement_triggered.inc({"agent_type": "single", "round": str(session._enforcement_rounds)})
+                        logger.info(
+                            "Session %s: enforcement round %d/%d, missing tools: %s",
+                            session.id, session._enforcement_rounds, MAX_ENFORCEMENT_ROUNDS, missing,
+                        )
+                        session.add_user_message(
+                            f"STOP — you have not called these required tools: {', '.join(sorted(missing))}. "
+                            f"Call them now before providing your diagnosis."
+                        )
+                        continue
+
                 self._process_final_response(session, full_text)
+                # Score fix confidence (Feature 3)
+                await self._score_fix_confidence(session)
+                # Verification loop (Feature 2)
+                if await self._verify_and_maybe_retry(session):
+                    continue  # retry with reviewer feedback
                 return
 
             # If there are tool calls, execute them and continue the loop
@@ -347,6 +370,7 @@ class DiagnosticOrchestrator:
             })
 
             session.tool_calls_made += 1
+            session.tools_called.add(block.name)
             tool_calls_metric.inc({
                 "tool_name": block.name,
                 "status": "error" if is_error else "ok",
@@ -481,6 +505,70 @@ class DiagnosticOrchestrator:
             "Session %s: pruned conversation from %d to %d messages",
             session.id, len(msgs), len(session.messages),
         )
+
+    # ------------------------------------------------------------------
+    # Fix confidence scoring (Feature 3)
+    # ------------------------------------------------------------------
+    async def _score_fix_confidence(self, session: DiagnosisSession) -> None:
+        """Calculate composite confidence score for the proposed fix."""
+        if not session.diagnosis or not session.fix_proposal:
+            return
+        try:
+            from .incident_memory import incident_memory
+            session.fix_confidence = await incident_memory.get_fix_confidence(
+                alert_name=session.alert.alert_name,
+                fix_summary=session.fix_proposal.summary,
+                diagnosis_confidence=session.diagnosis.confidence,
+                evidence_count=len(session.diagnosis.evidence),
+            )
+            from ..observability.metrics import fix_confidence_histogram
+            fix_confidence_histogram.observe(session.fix_confidence.score)
+            logger.info(
+                "Session %s: fix confidence %d%% (history=%s)",
+                session.id, session.fix_confidence.percentage, session.fix_confidence.has_history,
+            )
+        except Exception:
+            logger.warning("Fix confidence scoring failed for %s", session.id, exc_info=True)
+
+    # ------------------------------------------------------------------
+    # Verification loop (Feature 2)
+    # ------------------------------------------------------------------
+    async def _verify_and_maybe_retry(self, session: DiagnosisSession) -> bool:
+        """Run verification reviewer. Returns True if loop should continue (retry)."""
+        if not settings.fix_verification_enabled:
+            return False
+        if not session.fix_proposal or session.phase == SessionPhase.ESCALATED:
+            return False
+        if getattr(session, "_verification_retried", False):
+            return False  # already retried once
+
+        try:
+            from .verification import VerificationVerdict, extract_tool_results_summary, verify_fix
+            tool_summary = extract_tool_results_summary(session)
+            result = await verify_fix(session, tool_summary)
+            logger.info("Session %s: verification verdict=%s", session.id, result.verdict.value)
+
+            from ..observability.metrics import verification_overrides
+
+            if result.verdict == VerificationVerdict.REVISE:
+                session._verification_retried = True
+                verification_overrides.inc({"verdict": "revise"})
+                session.add_user_message(
+                    f"REVIEWER FEEDBACK: {result.feedback}\n\n"
+                    "Revise your diagnosis and/or fix proposal based on this feedback."
+                )
+                return True  # signal caller to continue the loop
+
+            if result.verdict == VerificationVerdict.REJECT:
+                verification_overrides.inc({"verdict": "reject"})
+                session.escalate(f"Fix rejected by reviewer: {result.feedback}")
+                return False
+
+            # APPROVE — proceed normally
+            return False
+        except Exception:
+            logger.warning("Verification failed for %s, proceeding anyway", session.id, exc_info=True)
+            return False  # fail-open
 
     def _build_opening_message(self, alert: GrafanaAlert, runbook=None) -> str:
         """Build the first user message that kicks off investigation."""

@@ -198,6 +198,23 @@ per_agent_tokens = _Counter(
     "Token usage broken down by agent type",
 )
 
+# Accuracy improvement metrics
+enforcement_triggered = _Counter(
+    "runbook_enforcement_triggered_total",
+    "Times tool-call enforcement forced continued investigation",
+)
+
+fix_confidence_histogram = _Histogram(
+    "runbook_fix_confidence_score",
+    "Composite fix confidence scores",
+    buckets=(0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, float("inf")),
+)
+
+verification_overrides = _Counter(
+    "runbook_verification_overrides_total",
+    "Times the verification reviewer overrode a fix proposal",
+)
+
 
 # ---------------------------------------------------------------------------
 # Collector
@@ -218,6 +235,9 @@ _ALL_METRICS = [
     specialist_invocations,
     coordinator_activations,
     per_agent_tokens,
+    enforcement_triggered,
+    fix_confidence_histogram,
+    verification_overrides,
 ]
 
 

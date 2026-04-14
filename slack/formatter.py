@@ -132,6 +132,13 @@ def format_diagnosis_result(session: DiagnosisSession) -> dict[str, Any]:
         if fix.rollback_plan:
             blocks.append(_section(f"*Rollback Plan:*\n{fix.rollback_plan}"))
 
+        # Fix confidence (from incident memory)
+        if session.fix_confidence is not None:
+            fc = session.fix_confidence
+            diag_label = session.diagnosis.confidence.value if session.diagnosis else "unknown"
+            conf_display = fc.display_str(diag_label)
+            blocks.append(_section(f":chart_with_upwards_trend: *Fix Confidence:* {conf_display}"))
+
         if fix.requires_human_values:
             fields = ", ".join(f"`{f}`" for f in fix.human_value_fields)
             blocks.append(

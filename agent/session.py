@@ -95,7 +95,9 @@ class DiagnosisSession:
 
         # Bookkeeping
         self.tool_calls_made: int = 0
+        self.tools_called: set[str] = set()  # specific tool names called
         self.total_tokens_used: int = 0
+        self.fix_confidence: Any | None = None  # FixConfidence from incident_memory
         self.error: str | None = None
 
         # Slack thread reference for sending updates

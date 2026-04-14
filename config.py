@@ -72,6 +72,11 @@ class Settings(BaseSettings):
     coordinator_model: str = "claude-opus-4-20250514"
     coordinator_token_budget: int = 8000
 
+    # Fix verification (secondary reviewer)
+    fix_verification_enabled: bool = True
+    fix_verification_model: str = "claude-3-5-haiku-20241022"
+    fix_verification_max_tokens: int = 1024
+
     # PagerDuty (Events API v2)
     pagerduty_routing_key: str = ""   # Integration key from PD service
     pagerduty_api_key: str = ""       # Full API key (optional — for notes)

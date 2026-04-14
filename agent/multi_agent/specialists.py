@@ -189,7 +189,26 @@ class SpecialistAgent:
             session.add_assistant_message(assistant_content)
 
             if response.stop_reason == "end_turn":
+                enforcement_rounds = getattr(session, "_enforcement_rounds", 0)
+                if enforcement_rounds < 3:
+                    from .tool_subsets import check_required_tools_met
+                    met, missing = check_required_tools_met(self.domain, session.tools_called)
+                    if not met:
+                        session._enforcement_rounds = enforcement_rounds + 1
+                        from ...observability.metrics import enforcement_triggered
+                        enforcement_triggered.inc({"agent_type": self.domain.value, "round": str(session._enforcement_rounds)})
+                        logger.info(
+                            "Session %s [%s]: enforcement round %d/3, missing: %s",
+                            session.id, self.domain.value, session._enforcement_rounds, missing,
+                        )
+                        session.add_user_message(
+                            f"STOP — you have not called these required tools: {', '.join(sorted(missing))}. "
+                            f"Call them now before providing your diagnosis."
+                        )
+                        continue
+
                 self._process_final(session, full_text)
+                await self._score_fix_confidence(session)
                 return
 
             if tool_use_blocks:
@@ -220,6 +239,7 @@ class SpecialistAgent:
                 "is_error": is_error,
             })
             session.tool_calls_made += 1
+            session.tools_called.add(block.name)
 
         session.messages.append({"role": "user", "content": tool_results})
 
@@ -263,6 +283,25 @@ class SpecialistAgent:
 
         if not diag and not fix and not escalate:
             session.escalate("Specialist completed but produced no parseable output.")
+
+    async def _score_fix_confidence(self, session: DiagnosisSession) -> None:
+        """Calculate composite confidence score for the proposed fix."""
+        if not session.diagnosis or not session.fix_proposal:
+            return
+        try:
+            from ..incident_memory import incident_memory
+            session.fix_confidence = await incident_memory.get_fix_confidence(
+                alert_name=session.alert.alert_name,
+                fix_summary=session.fix_proposal.summary,
+                diagnosis_confidence=session.diagnosis.confidence,
+                evidence_count=len(session.diagnosis.evidence),
+            )
+            logger.info(
+                "Session %s [%s]: fix confidence %d%%",
+                session.id, self.domain.value, session.fix_confidence.percentage,
+            )
+        except Exception:
+            logger.warning("Fix confidence scoring failed for %s", session.id, exc_info=True)
 
     def _build_opening(self, alert: GrafanaAlert, triage: TriageResult) -> str:
         lines = [

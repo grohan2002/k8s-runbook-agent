@@ -191,7 +191,7 @@ class DiagnosticOrchestrator:
                 system_prompt = build_system_prompt(alert, runbook, memory_context=memory_text)
 
                 # 4. Seed the conversation with the alert as the first user message
-                opening_message = self._build_opening_message(alert, runbook)
+                opening_message = await self._build_opening_message(alert, runbook)
                 session.add_user_message(opening_message)
 
                 # 5. Run the agentic loop
@@ -570,8 +570,12 @@ class DiagnosticOrchestrator:
             logger.warning("Verification failed for %s, proceeding anyway", session.id, exc_info=True)
             return False  # fail-open
 
-    def _build_opening_message(self, alert: GrafanaAlert, runbook=None) -> str:
-        """Build the first user message that kicks off investigation."""
+    async def _build_opening_message(self, alert: GrafanaAlert, runbook=None) -> str:
+        """Build the first user message with pre-fetched context.
+
+        Pre-fetches pod status and recent events so Claude starts with baseline
+        knowledge instead of wasting tool calls on basic discovery.
+        """
         lines = [
             f"A Grafana alert has fired. Please investigate and diagnose the issue.\n",
             f"Alert: {alert.alert_name}",
@@ -585,10 +589,40 @@ class DiagnosticOrchestrator:
         if alert.labels:
             lines.append(f"\nLabels: {json.dumps(alert.labels)}")
 
+        # Pre-fetch basic context to save Claude 2-3 tool calls
+        try:
+            if alert.pod:
+                result = await self.registry.dispatch("get_pod_status", {
+                    "namespace": alert.namespace,
+                    "pod_name": alert.pod,
+                })
+                if not result.get("is_error"):
+                    pod_text = ""
+                    for block in result.get("content", []):
+                        if block.get("type") == "text":
+                            pod_text += block["text"]
+                    if pod_text:
+                        lines.append(f"\n## Pre-fetched Pod Status\n{pod_text[:1500]}")
+
+            # Pre-fetch recent events
+            result = await self.registry.dispatch("get_events", {
+                "namespace": alert.namespace,
+                "since_minutes": "15",
+            })
+            if not result.get("is_error"):
+                events_text = ""
+                for block in result.get("content", []):
+                    if block.get("type") == "text":
+                        events_text += block["text"]
+                if events_text:
+                    lines.append(f"\n## Pre-fetched Events\n{events_text[:1500]}")
+        except Exception:
+            logger.debug("Pre-fetch failed for opening message — Claude will discover via tools")
+
         lines.append(
-            "\nStart your investigation now. Use the inspection tools to gather "
-            "evidence, then provide your diagnosis and fix proposal in the "
-            "required structured format."
+            "\nThe pod status and events above are pre-fetched for context. "
+            "You still MUST call the required inspection tools (get_pod_status, get_pod_logs, get_events, etc.) "
+            "to get full details before diagnosing. Start your investigation now."
         )
 
         return "\n".join(lines)

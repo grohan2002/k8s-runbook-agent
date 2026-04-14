@@ -128,8 +128,9 @@ def evaluate_guardrails(session: DiagnosisSession) -> GuardrailResult:
     # 3. Human values needed
     if fix.requires_human_values and fix.human_value_fields:
         result.block(
-            f"Fix requires human-provided values: {', '.join(fix.human_value_fields)}. "
-            "Provide these values before approving."
+            f"Fix requires human-provided values that the agent cannot determine:\n"
+            + "\n".join(f"  - {field}" for field in fix.human_value_fields)
+            + "\nReply in the Slack thread with the correct values, then re-trigger the investigation."
         )
 
     # 4. Check for replica changes in description
@@ -162,7 +163,10 @@ def evaluate_guardrails(session: DiagnosisSession) -> GuardrailResult:
                 "Diagnosis confidence is MEDIUM. Verify the evidence before approving."
             )
 
-    # 9. Composite fix confidence check
+    # 9. Compound fix detection
+    _check_compound_fix(fix.description + " " + (fix.dry_run_output or ""), result)
+
+    # 10. Composite fix confidence check
     if session.fix_confidence is not None:
         if session.fix_confidence.score < 0.3:
             result.block(
@@ -195,6 +199,31 @@ def _check_replica_guardrails(text: str, result: GuardrailResult) -> None:
             result.block(
                 f"Fix sets replicas to {count}, exceeding the maximum of {MAX_REPLICA_COUNT}."
             )
+
+
+def _check_compound_fix(text: str, result: GuardrailResult) -> None:
+    """Detect fixes that require multiple sequential steps.
+
+    The executor runs a single tool-use loop — it may miss step 1 if
+    steps are described sequentially. Warn the human to verify.
+    """
+    text_lower = text.lower()
+
+    # Patterns that indicate multi-step fixes
+    compound_signals = [
+        (r"(?:first|step\s*1).*(?:then|step\s*2|after\s+that|next|second)", "sequential steps described"),
+        (r"create\s+(?:configmap|secret|service).*(?:then|and\s+then|after).*patch", "create + patch sequence"),
+        (r"delete.*(?:then|and).*(?:create|apply|deploy)", "delete + create sequence"),
+    ]
+
+    for pattern, reason in compound_signals:
+        if re.search(pattern, text_lower, re.DOTALL):
+            result.warn(
+                f"Fix appears to require multiple sequential steps ({reason}). "
+                "The executor may not execute them in the correct order. "
+                "Review carefully and consider splitting into separate fixes."
+            )
+            return  # One warning is enough
 
 
 def _check_image_guardrails(text: str, result: GuardrailResult) -> None:

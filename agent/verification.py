@@ -52,25 +52,33 @@ REVIEWER_SYSTEM_PROMPT = """\
 You are a Kubernetes fix reviewer. A diagnostic agent investigated a K8s alert \
 and proposed a fix. Your job is to review the proposal for quality and safety.
 
-Check these 5 criteria:
-1. Does the evidence actually support the stated root cause?
-2. Does the fix address the root cause (not just a symptom)?
-3. Is the risk level assessment accurate for this type of change?
-4. Is the rollback plan complete and executable?
-5. Are there obvious side effects the fix could cause?
+Check ALL 8 criteria:
 
-Output EXACTLY one of these three responses (nothing else):
+1. EVIDENCE → ROOT CAUSE: Does the evidence actually support the stated root cause? \
+   Look for logical gaps — e.g., "exit code 1" does not prove OOMKilled.
+2. ROOT CAUSE vs SYMPTOM: Does the fix address the root cause, not just a symptom? \
+   "Restart pod" is a symptom fix if the root cause is a config error. \
+   "Increase memory" is a symptom fix if the root cause is a memory leak. \
+   REVISE if the fix is treating a symptom.
+3. RISK ACCURACY: Is the risk level correct? Consider deployment strategy \
+   (Recreate = full downtime = HIGH risk), stateful vs stateless, and blast radius.
+4. ROLLBACK PLAN: Is it complete, specific, and executable? "Undo the change" is too vague.
+5. SIDE EFFECTS: Could this fix break other workloads? Check for HPA interactions, \
+   shared ConfigMaps, node resource pressure, or cross-service dependencies.
+6. PREREQUISITES: Does the fix assume resources exist (ConfigMaps, Secrets, Services) \
+   that the evidence didn't verify? If yes, REVISE.
+7. COMPOUND FIX: Does the fix require multiple sequential steps? If step 2 depends on \
+   step 1, the executor may only do step 2. REVISE with "split into sequential fixes."
+8. FIX MATCHES TOOLS: Can the fix be executed with K8s patch/scale/restart/delete tools? \
+   If it requires manual actions or tools the agent doesn't have, mark HUMAN_VALUES_NEEDED.
+
+Output EXACTLY one of:
 
 APPROVE
-(if the fix looks sound on all 5 criteria)
-
 REVISE: <specific feedback on what needs to change>
-(if the fix has issues that can be corrected)
+REJECT: <reason the fix should not be proposed>
 
-REJECT: <reason the fix should not be proposed at all>
-(if the diagnosis is fundamentally wrong or the fix is dangerous)
-
-Be concise. One line for APPROVE, one paragraph max for REVISE/REJECT.
+Be concise. One paragraph max.
 """
 
 
@@ -144,22 +152,22 @@ def _build_reviewer_message(session: DiagnosisSession, tool_results_summary: str
         parts.append(f"- Confidence: {d.confidence.value}")
         if d.evidence:
             parts.append("- Evidence:")
-            for e in d.evidence[:10]:
+            for e in d.evidence:  # Full list — no truncation
                 parts.append(f"  - {e}")
         if d.ruled_out:
             parts.append("- Ruled Out:")
-            for r in d.ruled_out[:5]:
+            for r in d.ruled_out:  # Full list
                 parts.append(f"  - {r}")
 
-    # Fix proposal
+    # Fix proposal — full content for accurate review
     if session.fix_proposal:
         f = session.fix_proposal
         parts.append(f"\n## Proposed Fix")
         parts.append(f"- Summary: {f.summary}")
         parts.append(f"- Risk: {f.risk_level.value}")
-        parts.append(f"- Description: {f.description[:500]}")
+        parts.append(f"- Description: {f.description}")  # Full — no truncation
         if f.dry_run_output:
-            parts.append(f"- Dry Run: {f.dry_run_output[:300]}")
+            parts.append(f"- Dry Run: {f.dry_run_output}")  # Full
         parts.append(f"- Rollback Plan: {f.rollback_plan or 'NONE PROVIDED'}")
         if f.requires_human_values:
             parts.append(f"- Needs Human Input: {', '.join(f.human_value_fields)}")

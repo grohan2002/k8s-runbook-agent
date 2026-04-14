@@ -139,15 +139,22 @@ class FixExecutor:
 
         logger.info("Session %s: guardrails passed, starting execution", session.id)
 
-        # 2. Capture pre-state
+        # 2. Freshness check — re-inspect cluster state before executing
+        stale_warning = await self._check_freshness(session)
+        if stale_warning:
+            logger.warning("Session %s: freshness check: %s", session.id, stale_warning)
+
+        # 3. Capture pre-state
         try:
             pre_state = await capture_pre_state(session, self.registry)
             session.approval.pre_state_snapshot = pre_state
+            if stale_warning:
+                pre_state["freshness_warning"] = stale_warning
         except Exception as e:
             logger.exception("Failed to capture pre-state for session %s", session.id)
             pre_state = {"error": str(e)}
 
-        # 3. Build executor prompt
+        # 4. Build executor prompt
         fix = session.fix_proposal
         system_prompt = EXECUTOR_SYSTEM_PROMPT.format(
             fix_description=self._format_fix_for_executor(session),
@@ -190,6 +197,45 @@ class FixExecutor:
                 details=str(e),
                 guardrail_result=guardrail_result,
             )
+
+    async def _check_freshness(self, session: DiagnosisSession) -> str | None:
+        """Re-check cluster state before executing. Returns warning if stale, None if fresh."""
+        alert = session.alert
+        if not alert.pod:
+            return None
+
+        try:
+            result = await self.registry.dispatch("get_pod_status", {
+                "namespace": alert.namespace,
+                "pod_name": alert.pod,
+            })
+            current_status = _extract_text(result)
+
+            # Check if pod has self-healed
+            if result.get("is_error"):
+                if "not found" in current_status.lower():
+                    return f"Pod {alert.pod} no longer exists — it may have been deleted or replaced."
+
+            # Check for signs the issue resolved itself
+            lower = current_status.lower()
+            if "phase: running" in lower and "restarts: 0" in lower:
+                return (
+                    f"Pod {alert.pod} is now Running with 0 restarts. "
+                    "The issue may have self-healed since diagnosis."
+                )
+
+            # Check if diagnosis mentioned OOMKilled but pod is now in different state
+            if session.diagnosis and "oomkilled" in session.diagnosis.root_cause.lower():
+                if "oomkilled" not in lower and "phase: running" in lower:
+                    return (
+                        "Diagnosis was OOMKilled but pod is now Running without OOM. "
+                        "Condition may have changed."
+                    )
+
+        except Exception:
+            logger.debug("Freshness check failed for %s — proceeding anyway", session.id)
+
+        return None
 
     def _format_fix_for_executor(self, session: DiagnosisSession) -> str:
         """Format the approved fix proposal for the executor prompt."""

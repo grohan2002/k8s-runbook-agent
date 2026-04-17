@@ -84,6 +84,15 @@ def format_diagnosis_result(session: DiagnosisSession) -> dict[str, Any]:
             + f" | *Severity:* `{alert.severity}`"
         )
     )
+
+    # SLO impact (if annotations provided)
+    if alert.slo_name:
+        budget_str = ""
+        if alert.error_budget_remaining is not None:
+            emoji = ":red_circle:" if alert.error_budget_remaining < 10 else ":large_blue_circle:"
+            budget_str = f" | {emoji} *Error Budget:* `{alert.error_budget_remaining}%`"
+        blocks.append(_section(f":dart: *SLO:* `{alert.slo_name}`{budget_str}"))
+
     blocks.append(_divider())
 
     # Diagnosis

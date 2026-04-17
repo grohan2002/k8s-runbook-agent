@@ -199,6 +199,18 @@ async def lifespan(app: FastAPI):
     logger.info("  Retention manager: started (sessions=%dd, audit=%dd, memory=%dd)",
                 SESSION_RETENTION_DAYS, AUDIT_RETENTION_DAYS, MEMORY_RETENTION_DAYS)
 
+    # Start toil detector (SRE feature — weekly scan for recurring alerts)
+    from .agent.toil_detector import toil_detector
+
+    toil_task = asyncio.create_task(toil_detector.run())
+    if toil_detector.enabled:
+        logger.info(
+            "  Toil detector: started (interval=%dh, window=%dd, threshold=%d)",
+            settings.toil_detection_interval_hours,
+            settings.toil_detection_window_days,
+            settings.toil_detection_threshold,
+        )
+
     yield
 
     # Shutdown
@@ -208,8 +220,9 @@ async def lifespan(app: FastAPI):
     watcher_task.cancel()
     secret_reload_task.cancel()
     retention_task.cancel()
+    toil_task.cancel()
 
-    for task in (esc_task, watcher_task, secret_reload_task, retention_task):
+    for task in (esc_task, watcher_task, secret_reload_task, retention_task, toil_task):
         try:
             await task
         except asyncio.CancelledError:
@@ -537,6 +550,41 @@ async def get_session_audit(session_id: str) -> JSONResponse:
         "session_id": session_id,
         "entries": entries,
     })
+
+
+@app.get("/sessions/{session_id}/postmortem")
+async def get_session_postmortem(session_id: str, format: str = "markdown"):
+    """Get the post-mortem for a resolved/escalated session.
+
+    Returns cached post-mortem if available, or generates on demand.
+    Query param ?format=markdown (default) returns text/plain, ?format=json returns JSON.
+    """
+    if not debug_limiter.allow(f"postmortem:{session_id}"):
+        return JSONResponse(status_code=429, content={"error": "Rate limit exceeded"})
+
+    from .agent.session import session_store
+    from .agent.postmortem import generate_postmortem
+    from fastapi.responses import PlainTextResponse
+
+    session = session_store.get(session_id)
+    if session is None:
+        return JSONResponse(status_code=404, content={"error": "Session not found"})
+
+    # Use cached if available, else generate on demand
+    markdown = session.postmortem_markdown
+    if not markdown:
+        try:
+            markdown = await generate_postmortem(session)
+            session.postmortem_markdown = markdown
+        except Exception as e:
+            return JSONResponse(
+                status_code=500,
+                content={"error": "Failed to generate post-mortem", "detail": str(e)},
+            )
+
+    if format == "json":
+        return JSONResponse(content={"session_id": session_id, "postmortem": markdown})
+    return PlainTextResponse(content=markdown, media_type="text/markdown")
 
 
 # ---------------------------------------------------------------------------

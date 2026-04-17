@@ -167,6 +167,52 @@ async def post_in_thread(session: DiagnosisSession, message: dict[str, Any], tex
         logger.exception("Failed to post thread message for session %s", session.id)
 
 
+async def post_postmortem(session: DiagnosisSession, markdown: str) -> None:
+    """Post a markdown post-mortem as a collapsible block in the session thread.
+
+    Slack's mrkdwn has a 3000-char limit per block, so we split long post-mortems
+    into multiple section blocks.
+    """
+    channel = session.slack_channel or settings.slack_channel_id
+    if not channel or not session.slack_thread_ts:
+        return
+
+    header_block = {
+        "type": "header",
+        "text": {"type": "plain_text", "text": "📝 Post-Mortem", "emoji": True},
+    }
+
+    # Split the markdown into chunks of ~2800 chars at paragraph boundaries
+    blocks: list[dict[str, Any]] = [header_block]
+    max_chunk = 2800
+    paragraphs = markdown.split("\n\n")
+    current: list[str] = []
+    current_len = 0
+
+    for p in paragraphs:
+        p_len = len(p) + 2  # plus separator
+        if current_len + p_len > max_chunk and current:
+            blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": "\n\n".join(current)}})
+            current = [p]
+            current_len = p_len
+        else:
+            current.append(p)
+            current_len += p_len
+
+    if current:
+        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": "\n\n".join(current)}})
+
+    try:
+        await _slack_post(
+            channel=channel,
+            text="Post-mortem for " + session.alert.alert_name,
+            thread_ts=session.slack_thread_ts,
+            blocks=blocks,
+        )
+    except Exception:
+        logger.exception("Failed to post postmortem for session %s", session.id)
+
+
 # ---------------------------------------------------------------------------
 # Interactive endpoint — button clicks (Approve / Reject / Details)
 # ---------------------------------------------------------------------------

@@ -77,6 +77,12 @@ class Settings(BaseSettings):
     fix_verification_model: str = "claude-3-5-haiku-20241022"
     fix_verification_max_tokens: int = 1024
 
+    # Toil detection (SRE feature)
+    toil_detection_enabled: bool = True
+    toil_detection_interval_hours: int = 168  # weekly
+    toil_detection_window_days: int = 7
+    toil_detection_threshold: int = 5
+
     # PagerDuty (Events API v2)
     pagerduty_routing_key: str = ""   # Integration key from PD service
     pagerduty_api_key: str = ""       # Full API key (optional — for notes)

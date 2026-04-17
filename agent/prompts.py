@@ -198,6 +198,21 @@ def format_alert_context(alert: GrafanaAlert) -> str:
         for k, v in alert.annotations.items():
             lines.append(f"  {k}: {v}")
 
+    # SLO impact context (Feature: SLO Impact Awareness)
+    if alert.slo_name:
+        lines.append(f"\n**SLO:** {alert.slo_name}")
+        if alert.error_budget_remaining is not None:
+            lines.append(f"**Error Budget Remaining:** {alert.error_budget_remaining}%")
+            if alert.error_budget_remaining < 10:
+                lines.append(
+                    "⚠️ Error budget is critically low. Prefer lower-risk fixes; "
+                    "further outages from this fix will breach SLO."
+                )
+            else:
+                lines.append(
+                    "Consider error budget impact when choosing fix risk level."
+                )
+
     return "\n".join(lines)
 
 

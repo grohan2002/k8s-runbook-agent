@@ -525,6 +525,47 @@ async def get_fix_success_rates(alert_name: str, limit: int = 5) -> list[dict[st
         return []
 
 
+async def get_toil_candidates(
+    window_days: int = 7,
+    threshold: int = 5,
+) -> list[dict[str, Any]]:
+    """Cluster-wide aggregation: find alerts fired N+ times with the same fix.
+
+    A toil candidate is any (alert_name, fix_summary) pair that appeared
+    at least `threshold` times in the last `window_days`. Indicates a
+    recurring problem that should be permanently fixed instead of repeatedly
+    remediated.
+    """
+    pool = get_pool()
+    if not pool:
+        return []
+
+    try:
+        rows = await pool.fetch(
+            """
+            SELECT alert_name,
+                   fix_summary,
+                   COUNT(*) AS occurrences,
+                   COUNT(*) FILTER (WHERE outcome = 'success') AS successes,
+                   MIN(resolved_at) AS first_seen,
+                   MAX(resolved_at) AS last_seen,
+                   array_agg(DISTINCT namespace) AS namespaces
+            FROM incident_memory
+            WHERE resolved_at > now() - ($1 || ' days')::interval
+              AND fix_summary IS NOT NULL
+              AND fix_summary != ''
+            GROUP BY alert_name, fix_summary
+            HAVING COUNT(*) >= $2
+            ORDER BY occurrences DESC
+            """,
+            str(window_days), threshold,
+        )
+        return [dict(row) for row in rows]
+    except Exception:
+        logger.exception("Toil candidates query failed")
+        return []
+
+
 async def get_recurring_patterns(
     workload_key: str,
     window_days: int = 7,

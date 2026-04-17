@@ -44,6 +44,22 @@ class GrafanaAlert(BaseModel):
     def summary(self) -> str:
         return self.annotations.get("summary", self.alert_name)
 
+    @property
+    def slo_name(self) -> str | None:
+        """Optional SLO name from alert annotations (for SLO impact awareness)."""
+        return self.annotations.get("slo_name") or None
+
+    @property
+    def error_budget_remaining(self) -> float | None:
+        """Optional error budget remaining (percentage) from alert annotations."""
+        val = self.annotations.get("error_budget_remaining")
+        if val is None:
+            return None
+        try:
+            return float(val)
+        except (ValueError, TypeError):
+            return None
+
 
 # ---------------------------------------------------------------------------
 # Diagnostic runbook (loaded from YAML)

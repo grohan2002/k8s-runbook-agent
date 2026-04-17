@@ -215,6 +215,16 @@ verification_overrides = _Counter(
     "Times the verification reviewer overrode a fix proposal",
 )
 
+toil_candidates_detected = _Counter(
+    "runbook_toil_candidates_detected_total",
+    "Toil candidates detected during weekly scans (recurring alerts with same fix)",
+)
+
+postmortems_generated = _Counter(
+    "runbook_postmortems_generated_total",
+    "Post-mortems auto-generated on session resolution/escalation",
+)
+
 
 # ---------------------------------------------------------------------------
 # Collector
@@ -238,6 +248,8 @@ _ALL_METRICS = [
     enforcement_triggered,
     fix_confidence_histogram,
     verification_overrides,
+    toil_candidates_detected,
+    postmortems_generated,
 ]
 
 

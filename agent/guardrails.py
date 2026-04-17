@@ -163,7 +163,16 @@ def evaluate_guardrails(session: DiagnosisSession) -> GuardrailResult:
                 "Diagnosis confidence is MEDIUM. Verify the evidence before approving."
             )
 
-    # 9. Compound fix detection
+    # 9. SLO impact check (Feature: SLO Impact Awareness)
+    if session.alert.error_budget_remaining is not None:
+        if session.alert.error_budget_remaining < 10:
+            result.warn(
+                f"Low error budget ({session.alert.error_budget_remaining}%) for SLO "
+                f"'{session.alert.slo_name or 'unknown'}'. Verify fix carefully — "
+                "further outages will breach SLO."
+            )
+
+    # 10. Compound fix detection
     _check_compound_fix(fix.description + " " + (fix.dry_run_output or ""), result)
 
     # 10. Composite fix confidence check

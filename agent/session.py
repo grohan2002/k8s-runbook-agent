@@ -98,6 +98,7 @@ class DiagnosisSession:
         self.tools_called: set[str] = set()  # specific tool names called
         self.total_tokens_used: int = 0
         self.fix_confidence: Any | None = None  # FixConfidence from incident_memory
+        self.postmortem_markdown: str | None = None  # cached post-mortem
         self.error: str | None = None
 
         # Slack thread reference for sending updates
@@ -124,9 +125,10 @@ class DiagnosisSession:
         # Persist to PostgreSQL (non-blocking)
         _fire_and_forget(self._persist_and_audit(old.value, new_phase.value, actor))
 
-        # Record to incident memory on terminal phases
+        # Record to incident memory + generate post-mortem on terminal phases
         if new_phase in (SessionPhase.RESOLVED, SessionPhase.ESCALATED, SessionPhase.FAILED):
             _fire_and_forget(self._record_to_memory())
+            _fire_and_forget(self._post_postmortem())
 
     async def _record_to_memory(self) -> None:
         """Persist this session's learnings to incident memory."""
@@ -136,6 +138,31 @@ class DiagnosisSession:
             await incident_memory.record(self)
         except Exception:
             logger.warning("Failed to record incident memory for %s", self.id, exc_info=True)
+
+    async def _post_postmortem(self) -> None:
+        """Generate and post a markdown post-mortem for terminal sessions."""
+        try:
+            from .postmortem import generate_postmortem
+
+            markdown = await generate_postmortem(self)
+            self.postmortem_markdown = markdown  # cached for API retrieval
+
+            # Post to Slack thread if configured
+            if self.slack_thread_ts and self.slack_channel:
+                try:
+                    from ..slack.bot import post_postmortem
+                    await post_postmortem(self, markdown)
+                except Exception:
+                    logger.debug("Failed to post postmortem to Slack", exc_info=True)
+
+            # Increment metric
+            try:
+                from ..observability.metrics import postmortems_generated
+                postmortems_generated.inc({"outcome": self.phase.value})
+            except Exception:
+                pass
+        except Exception:
+            logger.warning("Failed to generate postmortem for %s", self.id, exc_info=True)
 
     async def _persist_and_audit(self, old_phase: str, new_phase: str, actor: str) -> None:
         """Save session state and write audit log entry."""

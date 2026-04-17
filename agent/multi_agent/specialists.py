@@ -232,6 +232,23 @@ class SpecialistAgent:
                 if cb.get("type") == "text":
                     result_text += cb["text"]
 
+            # Redact secrets/PII before passing back to Claude (defense in depth)
+            if settings.redaction_enabled:
+                from ..redaction import redact
+                redaction = redact(result_text)
+                if redaction.had_secrets:
+                    logger.info(
+                        "Session %s [%s]: redacted %d secret(s) from %s",
+                        session.id, self.domain.value, redaction.redaction_count, block.name,
+                    )
+                    try:
+                        from ...observability.metrics import secrets_redacted
+                        for kind, count in redaction.redactions.items():
+                            secrets_redacted.inc({"kind": kind, "source": block.name}, value=count)
+                    except Exception:
+                        pass
+                    result_text = redaction.text
+
             tool_results.append({
                 "type": "tool_result",
                 "tool_use_id": block.id,

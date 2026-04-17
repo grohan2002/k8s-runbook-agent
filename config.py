@@ -83,6 +83,10 @@ class Settings(BaseSettings):
     toil_detection_window_days: int = 7
     toil_detection_threshold: int = 5
 
+    # Prompt safety & redaction (AI gateway replacement)
+    redaction_enabled: bool = True
+    prompt_safety_enabled: bool = True
+
     # PagerDuty (Events API v2)
     pagerduty_routing_key: str = ""   # Integration key from PD service
     pagerduty_api_key: str = ""       # Full API key (optional — for notes)

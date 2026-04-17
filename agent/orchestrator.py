@@ -191,7 +191,7 @@ class DiagnosticOrchestrator:
                 system_prompt = build_system_prompt(alert, runbook, memory_context=memory_text)
 
                 # 4. Seed the conversation with the alert as the first user message
-                opening_message = await self._build_opening_message(alert, runbook)
+                opening_message = await self._build_opening_message(alert, runbook, session=session)
                 session.add_user_message(opening_message)
 
                 # 5. Run the agentic loop
@@ -361,6 +361,24 @@ class DiagnosticOrchestrator:
             for content_block in result.get("content", []):
                 if content_block.get("type") == "text":
                     result_text += content_block["text"]
+
+            # Redact secrets/PII before passing back to Claude (defense in depth)
+            if settings.redaction_enabled:
+                from .redaction import redact
+                redaction = redact(result_text)
+                if redaction.had_secrets:
+                    logger.info(
+                        "Session %s: redacted %d secret(s) from %s output (%s)",
+                        session.id, redaction.redaction_count, block.name,
+                        ",".join(redaction.redactions.keys()),
+                    )
+                    try:
+                        from ..observability.metrics import secrets_redacted
+                        for kind, count in redaction.redactions.items():
+                            secrets_redacted.inc({"kind": kind, "source": block.name}, value=count)
+                    except Exception:
+                        pass
+                    result_text = redaction.text
 
             tool_results.append({
                 "type": "tool_result",
@@ -570,24 +588,54 @@ class DiagnosticOrchestrator:
             logger.warning("Verification failed for %s, proceeding anyway", session.id, exc_info=True)
             return False  # fail-open
 
-    async def _build_opening_message(self, alert: GrafanaAlert, runbook=None) -> str:
+    async def _build_opening_message(self, alert: GrafanaAlert, runbook=None, session: DiagnosisSession | None = None) -> str:
         """Build the first user message with pre-fetched context.
 
         Pre-fetches pod status and recent events so Claude starts with baseline
         knowledge instead of wasting tool calls on basic discovery.
+
+        Untrusted fields (summary, annotations) are sanitized for prompt
+        injection before being embedded in Claude's context.
         """
+        from .prompt_safety import scan_and_wrap
+
+        # Sanitize user-controlled fields (summary from annotations)
+        safe_summary = alert.summary
+        if settings.prompt_safety_enabled and alert.summary:
+            safe_summary, safety_result = scan_and_wrap(alert.summary, source="alert_summary")
+            if safety_result.had_threats:
+                logger.warning(
+                    "Session %s: alert summary has injection risk=%s, matches=%s, unicode_tags=%d",
+                    session.id if session else "unknown", safety_result.risk.value,
+                    list(safety_result.matches.keys()), safety_result.stripped_unicode_tags,
+                )
+                try:
+                    from ..observability.metrics import prompt_injections_detected
+                    prompt_injections_detected.inc({
+                        "source": "alert_summary",
+                        "risk": safety_result.risk.value,
+                    })
+                except Exception:
+                    pass
+
         lines = [
             f"A Grafana alert has fired. Please investigate and diagnose the issue.\n",
             f"Alert: {alert.alert_name}",
             f"Severity: {alert.severity}",
-            f"Summary: {alert.summary}",
+            f"Summary: {safe_summary}",
             f"Namespace: {alert.namespace}",
         ]
         if alert.pod:
             lines.append(f"Pod: {alert.pod}")
 
         if alert.labels:
-            lines.append(f"\nLabels: {json.dumps(alert.labels)}")
+            # Labels come from Prometheus/alert rules — generally trusted, but still strip unicode tags
+            labels_str = json.dumps(alert.labels)
+            if settings.prompt_safety_enabled:
+                from .prompt_safety import scan
+                label_safety = scan(labels_str)
+                labels_str = label_safety.sanitized_text
+            lines.append(f"\nLabels: {labels_str}")
 
         # Pre-fetch basic context to save Claude 2-3 tool calls
         try:

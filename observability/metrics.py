@@ -225,6 +225,17 @@ postmortems_generated = _Counter(
     "Post-mortems auto-generated on session resolution/escalation",
 )
 
+# AI safety metrics
+secrets_redacted = _Counter(
+    "runbook_secrets_redacted_total",
+    "Secrets/PII redacted from tool outputs before reaching the LLM",
+)
+
+prompt_injections_detected = _Counter(
+    "runbook_prompt_injections_detected_total",
+    "Suspicious prompt injection patterns detected in untrusted input",
+)
+
 
 # ---------------------------------------------------------------------------
 # Collector
@@ -250,6 +261,8 @@ _ALL_METRICS = [
     verification_overrides,
     toil_candidates_detected,
     postmortems_generated,
+    secrets_redacted,
+    prompt_injections_detected,
 ]
 
 
